@@ -1,0 +1,257 @@
+package citron
+
+import (
+	"bytes"
+	"context"
+	_ "embed"
+	"fmt"
+	"io/fs"
+	"maps"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/mishudark/citron/analysis"
+	"github.com/mishudark/citron/caps"
+	"go.starlark.net/starlark"
+	"go.starlark.net/syntax"
+)
+
+//go:embed HARNESS_GUIDE.md
+var HarnessGuide string
+
+type Options struct {
+	// WorkingDir is the virtual root path for filesystem operations.
+	// All fs.access() calls are resolved relative to this root.
+	// Defaults to "/work" if empty.
+	WorkingDir string
+
+	// SeedDir is an optional real directory whose files are copied
+	// into the virtual filesystem before execution begins.
+	// When empty, the virtual filesystem starts clean.
+	SeedDir string
+
+	CommandAllowlist   []string
+	NetworkAllowlist   []string
+	ClassifiedPatterns []string
+	SecureOutputPath   string
+	TimeoutMs          int64
+}
+
+type Result struct {
+	Output   string
+	Duration int64
+}
+
+func Analyze(code string) error {
+	issues, err := analysis.Analyze("agent.star", []byte(code))
+	if err != nil {
+		return err
+	}
+	if len(issues) > 0 {
+		return issues[0]
+	}
+	return nil
+}
+
+// seedVirtualFS copies all regular files from a real directory into a VirtualFileSystem.
+func seedVirtualFS(vfs *caps.VirtualFileSystem, root, seedDir string) error {
+	return filepath.WalkDir(seedDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(seedDir, path)
+		if err != nil {
+			return err
+		}
+		vfs.Set(filepath.Join(root, filepath.ToSlash(rel)), string(content))
+		return nil
+	})
+}
+
+func vfsWorkingDir(opts Options) string {
+	if opts.WorkingDir != "" {
+		return opts.WorkingDir
+	}
+	return "/work"
+}
+
+func SafeExecute(code string, opts Options) (*Result, error) {
+	if err := Analyze(code); err != nil {
+		return nil, err
+	}
+
+	start := time.Now()
+
+	var secureOut *os.File
+	if opts.SecureOutputPath != "" {
+		f, err := os.OpenFile(opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = f.Close() }()
+		secureOut = f
+	}
+
+	var agentOut bytes.Buffer
+	ioCap := caps.NewIOCapability(secureOut, &agentOut)
+
+	dict := starlark.StringDict{
+		"io": &starlarkIO{io: ioCap},
+	}
+
+	vfs := caps.NewVirtualFileSystem()
+	wd := vfsWorkingDir(opts)
+	if opts.SeedDir != "" {
+		if err := seedVirtualFS(vfs, wd, opts.SeedDir); err != nil {
+			return nil, fmt.Errorf("seed: %w", err)
+		}
+	}
+
+	var execErr error
+	fsCfg := &caps.FileSystemConfig{ClassifiedPatterns: opts.ClassifiedPatterns}
+
+	ctx := context.Background()
+	var cancel context.CancelFunc
+	if opts.TimeoutMs > 0 {
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(opts.TimeoutMs)*time.Millisecond)
+		defer cancel()
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, execErr = caps.RequestVirtualFileSystem(wd, vfs, fsCfg, func(fs caps.FileSystem) (any, error) {
+			dict["fs"] = &starlarkFileSystem{fs: fs}
+			_, errNet := caps.RequestNetwork(opts.NetworkAllowlist, func(net caps.Network) (any, error) {
+				dict["net"] = &starlarkNetwork{n: net}
+				_, errProc := caps.RequestExecPermission(opts.CommandAllowlist, func(proc caps.ProcessPermission) (any, error) {
+					dict["proc"] = &starlarkProc{p: proc}
+
+					thread := &starlark.Thread{Name: "agent"}
+					thread.Print = func(_ *starlark.Thread, msg string) { ioCap.Println(msg) }
+					_, errStar := starlark.ExecFileOptions(&syntax.FileOptions{}, thread, "agent.star", code, dict)
+					return nil, errStar
+				})
+				return nil, errProc
+			})
+			return nil, errNet
+		})
+		done <- execErr
+	}()
+
+	select {
+	case execErr = <-done:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("execution timed out after %dms", opts.TimeoutMs)
+	}
+
+	if execErr != nil {
+		return nil, execErr
+	}
+
+	return &Result{
+		Output:   agentOut.String(),
+		Duration: time.Since(start).Milliseconds(),
+	}, nil
+}
+
+type Session struct {
+	opts    Options
+	vfs     *caps.VirtualFileSystem
+	globals starlark.StringDict
+}
+
+func NewSession(opts Options) *Session {
+	vfs := caps.NewVirtualFileSystem()
+	wd := vfsWorkingDir(opts)
+	if opts.SeedDir != "" {
+		_ = seedVirtualFS(vfs, wd, opts.SeedDir)
+	}
+	return &Session{
+		opts:    opts,
+		vfs:     vfs,
+		globals: make(starlark.StringDict),
+	}
+}
+
+func (s *Session) Execute(code string) (*Result, error) {
+	if err := Analyze(code); err != nil {
+		return nil, err
+	}
+
+	start := time.Now()
+
+	var secureOut *os.File
+	if s.opts.SecureOutputPath != "" {
+		f, err := os.OpenFile(s.opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = f.Close() }()
+		secureOut = f
+	}
+
+	var agentOut bytes.Buffer
+	ioCap := caps.NewIOCapability(secureOut, &agentOut)
+	s.globals["io"] = &starlarkIO{io: ioCap}
+
+	var execErr error
+
+	ctx := context.Background()
+	var cancel context.CancelFunc
+	if s.opts.TimeoutMs > 0 {
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(s.opts.TimeoutMs)*time.Millisecond)
+		defer cancel()
+	}
+
+	fsCfg := &caps.FileSystemConfig{ClassifiedPatterns: s.opts.ClassifiedPatterns}
+	wd := vfsWorkingDir(s.opts)
+
+	done := make(chan error, 1)
+	go func() {
+		_, execErr = caps.RequestVirtualFileSystem(wd, s.vfs, fsCfg, func(fs caps.FileSystem) (any, error) {
+			s.globals["fs"] = &starlarkFileSystem{fs: fs}
+			_, errNet := caps.RequestNetwork(s.opts.NetworkAllowlist, func(net caps.Network) (any, error) {
+				s.globals["net"] = &starlarkNetwork{n: net}
+				_, errProc := caps.RequestExecPermission(s.opts.CommandAllowlist, func(proc caps.ProcessPermission) (any, error) {
+					s.globals["proc"] = &starlarkProc{p: proc}
+
+					thread := &starlark.Thread{Name: "agent"}
+					thread.Print = func(_ *starlark.Thread, msg string) { ioCap.Println(msg) }
+					resultDict, errStar := starlark.ExecFileOptions(&syntax.FileOptions{}, thread, "agent.star", code, s.globals)
+					if errStar == nil {
+						maps.Copy(s.globals, resultDict)
+					}
+					return nil, errStar
+				})
+				return nil, errProc
+			})
+			return nil, errNet
+		})
+		done <- execErr
+	}()
+
+	select {
+	case execErr = <-done:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("execution timed out after %dms", s.opts.TimeoutMs)
+	}
+
+	if execErr != nil {
+		return nil, execErr
+	}
+
+	return &Result{
+		Output:   agentOut.String(),
+		Duration: time.Since(start).Milliseconds(),
+	}, nil
+}
+
+func (s *Session) Close() {}
