@@ -37,6 +37,7 @@ import (
 
 	"github.com/mishudark/citron"
 	"github.com/mishudark/citron/analysis"
+	"github.com/mishudark/citron/mcpclient"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -68,15 +69,7 @@ type AnalyzeIssue struct {
 }
 
 type CapabilitiesResult struct {
-	Capabilities []CapabilityInfo `json:"capabilities"`
-}
-
-type CapabilityInfo struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Globals     string `json:"globals"`
-	Methods     string `json:"methods"`
-	Example     string `json:"example"`
+	Capabilities []mcpclient.CapabilityInfo `json:"capabilities"`
 }
 
 type HarnessGuideResult struct {
@@ -144,8 +137,10 @@ func main() {
 }
 
 // NewServer creates an MCP server with all citron tools registered.
+// remoteCaps are optional capabilities from generated RegisterRemoteTools
+// that get appended to the list_capabilities response.
 // It is exported for testing.
-func NewServer(opts citron.Options) *mcp.Server {
+func NewServer(opts citron.Options, remoteCaps ...mcpclient.CapabilityInfo) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "citron-mcp-server",
 		Version: "1.0.0",
@@ -207,7 +202,7 @@ func NewServer(opts citron.Options) *mcp.Server {
 		Name:        "list_capabilities",
 		Description: "Lists all citron capabilities available in the Starlark execution environment (fs, net, proc, io) with their methods and usage examples.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, CapabilitiesResult, error) {
-		return nil, CapabilitiesResult{Capabilities: []CapabilityInfo{
+		caps := []mcpclient.CapabilityInfo{
 			{
 				Name:        "FileSystem",
 				Description: "Access to a virtual in-memory filesystem. All paths relative to the working directory. Supports classified and unclassified reads/writes.",
@@ -243,7 +238,9 @@ func NewServer(opts citron.Options) *mcp.Server {
 				Methods:     "classified.map(callback) -> Classified\nclassified.flat_map(callback) -> Classified",
 				Example:     `secret = fs.access("key.txt").read_classified()` + "\n" + `def to_upper(s): return s.upper()` + "\n" + `upper = secret.map(to_upper)` + "\n" + `io.println(upper)  # Classified(****)`,
 			},
-		}}, nil
+		}
+		caps = append(caps, remoteCaps...)
+		return nil, CapabilitiesResult{Capabilities: caps}, nil
 	})
 
 	// Add the harness guide as a readable resource (in addition to the tool).
