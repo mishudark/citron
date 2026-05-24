@@ -14,7 +14,7 @@ func main() {
 
 	dir, _ := os.MkdirTemp("", "citron-example-*")
 	defer os.RemoveAll(dir)
-	os.WriteFile(dir+"/hello.txt", []byte("Hello from citron!"), 0644)
+	os.WriteFile(dir+"/hello.txt", []byte("Hello from citron!"), 0o644)
 
 	opts := citron.Options{
 		SeedDir:          dir,

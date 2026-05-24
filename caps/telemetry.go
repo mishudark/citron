@@ -12,8 +12,10 @@ import (
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
-var globalTracerProvider trace.TracerProvider = otel.GetTracerProvider()
-var globalMeterProvider metric.MeterProvider = otel.GetMeterProvider()
+var (
+	globalTracerProvider trace.TracerProvider = otel.GetTracerProvider()
+	globalMeterProvider  metric.MeterProvider = otel.GetMeterProvider()
+)
 
 // SetTracerProvider sets the global tracer provider for capability tracing.
 // If tp is nil, the global OTel tracer provider is used.

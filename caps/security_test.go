@@ -78,9 +78,9 @@ func TestSecurityClassifiedEqualityNoLeak(t *testing.T) {
 
 	// struct comparison in Go uses field-by-field comparison
 	// Since value is unexported, == is not allowed
-	var _ = c1
-	var _ = c2
-	var _ = c3
+	_ = c1
+	_ = c2
+	_ = c3
 }
 
 func TestSecurityFileEntryUsedAfterScope(t *testing.T) {

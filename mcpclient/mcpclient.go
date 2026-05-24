@@ -51,8 +51,8 @@ const (
 )
 
 var transportNames = map[TransportType]string{
-	TransportStdio:            "stdio",
-	TransportSSE:              "sse",
+	TransportStdio:          "stdio",
+	TransportSSE:            "sse",
 	TransportStreamableHTTP: "streamable-http",
 }
 

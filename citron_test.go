@@ -16,7 +16,7 @@ func TestSafeExecuteRejectsImports(t *testing.T) {
 
 func TestSafeExecuteRejectsUnsafeCode(t *testing.T) {
 	dir := t.TempDir()
-	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("API_KEY=secret123"), 0644)
+	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("API_KEY=secret123"), 0o644)
 
 	tests := []struct {
 		name string
@@ -83,7 +83,7 @@ func TestSessionRejectsImports(t *testing.T) {
 
 func TestSessionRejectsImpureClassifiedCallback(t *testing.T) {
 	dir := t.TempDir()
-	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("secret"), 0644)
+	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("secret"), 0o644)
 
 	s := NewSession(Options{
 		SeedDir:            dir,

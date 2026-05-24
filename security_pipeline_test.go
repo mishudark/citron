@@ -8,7 +8,7 @@ import (
 
 func TestPipelinePureMap(t *testing.T) {
 	dir := t.TempDir()
-	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("secret"), 0644)
+	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("secret"), 0o644)
 
 	code := `
 entry = fs.access(".env")
@@ -29,7 +29,7 @@ io.println(result)
 
 func TestPipelineImpureMapBlocked(t *testing.T) {
 	dir := t.TempDir()
-	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("API_KEY=supersecret"), 0644)
+	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("API_KEY=supersecret"), 0o644)
 
 	code := `
 entry = fs.access(".env")
@@ -50,7 +50,7 @@ io.println(result)
 
 func TestPipelineImpureFsAccessMapBlocked(t *testing.T) {
 	dir := t.TempDir()
-	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("secret"), 0644)
+	_ = os.WriteFile(filepath.Join(dir, ".env"), []byte("secret"), 0o644)
 
 	code := `
 entry = fs.access(".env")

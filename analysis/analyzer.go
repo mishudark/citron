@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"fmt"
+
 	"go.starlark.net/syntax"
 )
 

@@ -93,7 +93,7 @@ func main() {
 		return
 	}
 
-	if err := os.WriteFile(cfg.output, code, 0644); err != nil {
+	if err := os.WriteFile(cfg.output, code, 0o644); err != nil {
 		log.Fatalf("write %s: %v", cfg.output, err)
 	}
 
