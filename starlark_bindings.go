@@ -94,6 +94,7 @@ func (s *starlarkFileEntry) Attr(name string) (starlark.Value, error) {
 	}
 	return nil, nil
 }
+
 func (s *starlarkFileEntry) AttrNames() []string {
 	return []string{"read", "write", "read_classified", "write_classified"}
 }

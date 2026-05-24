@@ -141,7 +141,8 @@ Each span carries relevant attributes (root path, hosts, command, args) and reco
 | Metric | Tags | Description |
 |---|---|---|
 | `caps.requests` | `type` | Number of capability grants by type (filesystem, network, process, virtual_filesystem) |
-| `caps.operations` | `operation`, `status` | Number of capability operations by name and outcome (ok / error) |
+| `caps.operations` | `operation`, `status`, `error_kind` | Number of capability operations by name and outcome. `error_kind` distinguishes analysis / runtime / timeout / setup failures. |
+| `caps.operation_duration_ms` | `operation`, `status` | Histogram of capability operation duration in milliseconds. |
 
 ### Configuration
 

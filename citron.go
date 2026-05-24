@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"maps"
@@ -171,7 +172,7 @@ func SafeExecute(code string, opts Options) (*Result, error) {
 
 	if err := Analyze(code); err != nil {
 		caps.EndSpan(span, err)
-		caps.RecordOperation(context.Background(), "safe_execute", err)
+		caps.RecordOperationWithKind(context.Background(), "safe_execute", "analysis", err)
 		return nil, err
 	}
 
@@ -182,7 +183,7 @@ func SafeExecute(code string, opts Options) (*Result, error) {
 		f, err := os.OpenFile(opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
 			caps.EndSpan(span, err)
-			caps.RecordOperation(context.Background(), "safe_execute", err)
+			caps.RecordOperationWithKind(context.Background(), "safe_execute", "setup", err)
 			return nil, err
 		}
 		defer func() { _ = f.Close() }()
@@ -205,7 +206,7 @@ func SafeExecute(code string, opts Options) (*Result, error) {
 	if opts.SeedDir != "" {
 		if err := seedVirtualFS(vfs, wd, opts.SeedDir); err != nil {
 			caps.EndSpan(span, err)
-			caps.RecordOperation(context.Background(), "safe_execute", err)
+			caps.RecordOperationWithKind(context.Background(), "safe_execute", "setup", err)
 			return nil, fmt.Errorf("seed: %w", err)
 		}
 	}
@@ -244,19 +245,25 @@ func SafeExecute(code string, opts Options) (*Result, error) {
 	select {
 	case execErr = <-done:
 	case <-ctx.Done():
+		duration := time.Since(start)
 		caps.EndSpan(span, fmt.Errorf("execution timed out after %dms", opts.TimeoutMs))
-		caps.RecordOperation(context.Background(), "safe_execute", fmt.Errorf("execution timed out after %dms", opts.TimeoutMs))
+		caps.RecordOperationWithKind(context.Background(), "safe_execute", "timeout", fmt.Errorf("execution timed out after %dms", opts.TimeoutMs))
+		caps.RecordOperationDuration(context.Background(), "safe_execute", duration, fmt.Errorf("execution timed out after %dms", opts.TimeoutMs))
 		return nil, fmt.Errorf("execution timed out after %dms", opts.TimeoutMs)
 	}
 
+	duration := time.Since(start)
+
 	if execErr != nil {
 		caps.EndSpan(span, execErr)
-		caps.RecordOperation(context.Background(), "safe_execute", execErr)
-		return nil, execErr
+		caps.RecordOperationWithKind(context.Background(), "safe_execute", "runtime", execErr)
+		caps.RecordOperationDuration(context.Background(), "safe_execute", duration, execErr)
+		return nil, formatExecError(execErr)
 	}
 
 	caps.EndSpan(span, nil)
-	caps.RecordOperation(context.Background(), "safe_execute", nil)
+	caps.RecordOperationWithKind(context.Background(), "safe_execute", "", nil)
+	caps.RecordOperationDuration(context.Background(), "safe_execute", duration, nil)
 	return &Result{
 		Output:   agentOut.String(),
 		Duration: time.Since(start).Milliseconds(),
@@ -305,7 +312,7 @@ func (s *Session) Execute(code string) (*Result, error) {
 
 	if err := Analyze(code); err != nil {
 		caps.EndSpan(span, err)
-		caps.RecordOperation(context.Background(), "session_execute", err)
+		caps.RecordOperationWithKind(context.Background(), "session_execute", "analysis", err)
 		return nil, err
 	}
 
@@ -316,7 +323,7 @@ func (s *Session) Execute(code string) (*Result, error) {
 		f, err := os.OpenFile(s.opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
 			caps.EndSpan(span, err)
-			caps.RecordOperation(context.Background(), "session_execute", err)
+			caps.RecordOperationWithKind(context.Background(), "session_execute", "setup", err)
 			return nil, err
 		}
 		defer func() { _ = f.Close() }()
@@ -368,19 +375,25 @@ func (s *Session) Execute(code string) (*Result, error) {
 	select {
 	case execErr = <-done:
 	case <-ctx.Done():
+		duration := time.Since(start)
 		caps.EndSpan(span, fmt.Errorf("execution timed out after %dms", s.opts.TimeoutMs))
-		caps.RecordOperation(context.Background(), "session_execute", fmt.Errorf("execution timed out after %dms", s.opts.TimeoutMs))
+		caps.RecordOperationWithKind(context.Background(), "session_execute", "timeout", fmt.Errorf("execution timed out after %dms", s.opts.TimeoutMs))
+		caps.RecordOperationDuration(context.Background(), "session_execute", duration, fmt.Errorf("execution timed out after %dms", s.opts.TimeoutMs))
 		return nil, fmt.Errorf("execution timed out after %dms", s.opts.TimeoutMs)
 	}
 
+	duration := time.Since(start)
+
 	if execErr != nil {
 		caps.EndSpan(span, execErr)
-		caps.RecordOperation(context.Background(), "session_execute", execErr)
-		return nil, execErr
+		caps.RecordOperationWithKind(context.Background(), "session_execute", "runtime", execErr)
+		caps.RecordOperationDuration(context.Background(), "session_execute", duration, execErr)
+		return nil, formatExecError(execErr)
 	}
 
 	caps.EndSpan(span, nil)
-	caps.RecordOperation(context.Background(), "session_execute", nil)
+	caps.RecordOperationWithKind(context.Background(), "session_execute", "", nil)
+	caps.RecordOperationDuration(context.Background(), "session_execute", duration, nil)
 	return &Result{
 		Output:   agentOut.String(),
 		Duration: time.Since(start).Milliseconds(),
@@ -388,3 +401,13 @@ func (s *Session) Execute(code string) (*Result, error) {
 }
 
 func (s *Session) Close() {}
+
+// formatExecError enriches a Starlark evaluation error with the full call
+// stack traceback.
+func formatExecError(err error) error {
+	var evalErr *starlark.EvalError
+	if errors.As(err, &evalErr) {
+		return fmt.Errorf("agent.star: %s\n%s", evalErr.Msg, evalErr.Backtrace())
+	}
+	return err
+}

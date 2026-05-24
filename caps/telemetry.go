@@ -2,6 +2,7 @@ package caps
 
 import (
 	"context"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -98,4 +99,55 @@ func RecordOperation(ctx context.Context, operation string, err error) {
 		attribute.String("operation", operation),
 		attribute.String("status", status),
 	))
+}
+
+// RecordOperationWithKind records a capability operation outcome with a
+// classified error kind dimension.  The kind distinguishes error categories
+// such as "analysis", "timeout", "runtime", "setup", or "capability".
+// When err is nil the kind is ignored.
+func RecordOperationWithKind(ctx context.Context, operation, kind string, err error) {
+	status := "ok"
+	if err != nil {
+		status = "error"
+	}
+
+	attrs := []attribute.KeyValue{
+		attribute.String("operation", operation),
+		attribute.String("status", status),
+	}
+	if err != nil && kind != "" {
+		attrs = append(attrs, attribute.String("error_kind", kind))
+	}
+
+	c, cerr := meter().Int64Counter("caps.operations",
+		metric.WithDescription("Total number of capability operations"),
+		metric.WithUnit("1"),
+	)
+	if cerr != nil {
+		return
+	}
+	c.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// RecordOperationDuration records the execution duration of a capability
+// operation as a histogram, tagged with operation name and status.
+func RecordOperationDuration(ctx context.Context, operation string, duration time.Duration, err error) {
+	status := "ok"
+	if err != nil {
+		status = "error"
+	}
+
+	h, herr := meter().Int64Histogram("caps.operation_duration_ms",
+		metric.WithDescription("Duration of capability operations"),
+		metric.WithUnit("ms"),
+	)
+	if herr != nil {
+		return
+	}
+	h.Record(ctx, duration.Milliseconds(),
+		metric.WithAttributes(
+			attribute.String("operation", operation),
+			attribute.String("status", status),
+		),
+	)
 }
