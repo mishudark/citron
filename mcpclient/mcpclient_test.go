@@ -294,6 +294,238 @@ func TestGenerateTools_NoSchema(t *testing.T) {
 	}
 }
 
+func TestGenerateAll_ToolsOnly(t *testing.T) {
+	tools := []*ToolInfo{{Name: "echo", Description: "Echo input"}}
+	code, err := GenerateAll(tools, nil, nil, GenOptions{PackageName: "test"})
+	if err != nil {
+		t.Fatalf("GenerateAll: %v", err)
+	}
+	src := string(code)
+	if !strings.Contains(src, `"echo"`) {
+		t.Fatal("generated code missing echo tool")
+	}
+	if !strings.Contains(src, `CallTool`) {
+		t.Fatal("generated code should use CallTool for tools")
+	}
+}
+
+func TestGenerateAll_WithResources(t *testing.T) {
+	resources := []*ResourceInfo{
+		{Name: "docs", Description: "Documentation", URI: "docs://getting-started", MIMEType: "text/markdown"},
+	}
+	code, err := GenerateAll(nil, resources, nil, GenOptions{PackageName: "test"})
+	if err != nil {
+		t.Fatalf("GenerateAll: %v", err)
+	}
+	src := string(code)
+	if !strings.Contains(src, `"get_docs"`) {
+		t.Fatalf("generated code missing get_docs resource builtin\n%s", src)
+	}
+	if !strings.Contains(src, `ReadResource`) {
+		t.Fatal("generated code should use ReadResource for resources")
+	}
+	if !strings.Contains(src, `ReadResourceResultToStarlark`) {
+		t.Fatal("generated code should convert resource results")
+	}
+}
+
+func TestGenerateAll_WithPrompts(t *testing.T) {
+	prompts := []*PromptInfo{
+		{
+			Name:        "summarize",
+			Description: "Summarize text",
+			Arguments: []PromptArgInfo{
+				{Name: "text", Description: "Text to summarize", Required: true},
+			},
+		},
+	}
+	code, err := GenerateAll(nil, nil, prompts, GenOptions{PackageName: "test"})
+	if err != nil {
+		t.Fatalf("GenerateAll: %v", err)
+	}
+	src := string(code)
+	if !strings.Contains(src, `"summarize"`) {
+		t.Fatalf("generated code missing summarize prompt builtin\n%s", src)
+	}
+	if !strings.Contains(src, `GetPrompt`) {
+		t.Fatal("generated code should use GetPrompt for prompts")
+	}
+	if !strings.Contains(src, `GetPromptResultToStarlark`) {
+		t.Fatal("generated code should convert prompt results")
+	}
+}
+
+func TestGenerateAll_AllCapabilities(t *testing.T) {
+	tools := []*ToolInfo{{Name: "echo", Description: "Echo input"}}
+	resources := []*ResourceInfo{{Name: "config", Description: "Server config", URI: "config://settings"}}
+	prompts := []*PromptInfo{{Name: "help", Description: "Get help"}}
+
+	code, err := GenerateAll(tools, resources, prompts, GenOptions{PackageName: "full"})
+	if err != nil {
+		t.Fatalf("GenerateAll: %v", err)
+	}
+	src := string(code)
+
+	// All three should appear.
+	if !strings.Contains(src, `"echo"`) {
+		t.Fatal("generated code missing echo tool")
+	}
+	if !strings.Contains(src, `"get_config"`) {
+		t.Fatal("generated code missing get_config resource")
+	}
+	if !strings.Contains(src, `"help"`) {
+		t.Fatal("generated code missing help prompt")
+	}
+
+	// All three call patterns should appear.
+	if !strings.Contains(src, `CallTool`) {
+		t.Fatal("generated code missing CallTool")
+	}
+	if !strings.Contains(src, `ReadResource`) {
+		t.Fatal("generated code missing ReadResource")
+	}
+	if !strings.Contains(src, `GetPrompt`) {
+		t.Fatal("generated code missing GetPrompt")
+	}
+}
+
+func TestGenerateAll_EmptyAll(t *testing.T) {
+	code, err := GenerateAll(nil, nil, nil, GenOptions{PackageName: "empty"})
+	if err != nil {
+		t.Fatalf("GenerateAll(nil, nil, nil): %v", err)
+	}
+	if !strings.Contains(string(code), "StringDict{}") {
+		t.Fatal("generated code for no capabilities should return empty StringDict")
+	}
+}
+
+func TestGenerateAll_MissingPackageName(t *testing.T) {
+	_, err := GenerateAll(nil, nil, nil, GenOptions{})
+	if err == nil {
+		t.Fatal("GenerateAll with empty PackageName should error")
+	}
+}
+
+func TestGenerateAll_CustomFuncName(t *testing.T) {
+	tools := []*ToolInfo{{Name: "ping"}}
+	resources := []*ResourceInfo{{Name: "status", URI: "status://health"}}
+	prompts := []*PromptInfo{{Name: "help"}}
+	code, err := GenerateAll(tools, resources, prompts, GenOptions{PackageName: "pkg", FuncName: "MyRegister"})
+	if err != nil {
+		t.Fatalf("GenerateAll: %v", err)
+	}
+	if !strings.Contains(string(code), "func MyRegister") {
+		t.Fatal("generated code should use custom function name")
+	}
+}
+
+// -- GenerateServerTools tests -- //
+
+func TestGenerateServerTools_Basic(t *testing.T) {
+	tools := []*ToolInfo{
+		{
+			Name:        "get_weather",
+			Description: "Get current weather for a location",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"location": map[string]any{"type": "string"},
+					"units":    map[string]any{"type": "string", "enum": []any{"celsius", "fahrenheit"}},
+				},
+				"required": []any{"location"},
+			},
+		},
+	}
+	code, err := GenerateServerTools(tools, GenOptions{PackageName: "mytools"})
+	if err != nil {
+		t.Fatalf("GenerateServerTools: %v", err)
+	}
+	src := string(code)
+
+	// Check basic structure
+	if !strings.Contains(src, "package mytools") {
+		t.Fatal("missing package declaration")
+	}
+	if !strings.Contains(src, "func RegisterRemoteTools") {
+		t.Fatal("missing RegisterRemoteTools function")
+	}
+	if !strings.Contains(src, "server.AddTool") {
+		t.Fatal("missing server.AddTool call")
+	}
+	if !strings.Contains(src, "session.CallTool") {
+		t.Fatal("missing session.CallTool proxy call")
+	}
+	if !strings.Contains(src, "mcpclient.CapabilityInfo") {
+		t.Fatal("missing CapabilityInfo return type")
+	}
+	if !strings.Contains(src, `"get_weather"`) {
+		t.Fatal("missing get_weather tool name")
+	}
+	if !strings.Contains(src, "list_capabilities") {
+		t.Fatal("missing list_capabilities reference")
+	}
+}
+
+func TestGenerateServerTools_NoSchema(t *testing.T) {
+	tools := []*ToolInfo{{Name: "ping", Description: "Ping the server"}}
+	code, err := GenerateServerTools(tools, GenOptions{PackageName: "test"})
+	if err != nil {
+		t.Fatalf("GenerateServerTools: %v", err)
+	}
+	src := string(code)
+	if !strings.Contains(src, `json.RawMessage(nil)`) {
+		t.Fatal("tool with no schema should have InputSchema: nil -> json.RawMessage(nil)")
+	}
+	if !strings.Contains(src, `"ping"`) {
+		t.Fatal("missing ping tool")
+	}
+}
+
+func TestGenerateServerTools_Empty(t *testing.T) {
+	code, err := GenerateServerTools(nil, GenOptions{PackageName: "empty"})
+	if err != nil {
+		t.Fatalf("GenerateServerTools(nil): %v", err)
+	}
+	if !strings.Contains(string(code), "package empty") {
+		t.Fatal("missing package")
+	}
+	if strings.Contains(string(code), "server.AddTool") {
+		t.Fatal("empty tools should not produce AddTool calls")
+	}
+}
+
+func TestGenerateServerTools_MissingPackageName(t *testing.T) {
+	_, err := GenerateServerTools(nil, GenOptions{})
+	if err == nil {
+		t.Fatal("GenerateServerTools with empty PackageName should error")
+	}
+}
+
+func TestGenerateServerTools_MethodsString(t *testing.T) {
+	tools := []*ToolInfo{
+		{
+			Name: "search",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query": map[string]any{"type": "string"},
+				},
+			},
+		},
+	}
+	code, err := GenerateServerTools(tools, GenOptions{PackageName: "test"})
+	if err != nil {
+		t.Fatalf("GenerateServerTools: %v", err)
+	}
+	src := string(code)
+	if !strings.Contains(src, "search(query=<string>)") {
+		t.Fatalf("generated code should include formatted methods string\n%s", src)
+	}
+	if !strings.Contains(src, `result = search(query=`) {
+		t.Fatalf("generated code should include example string\n%s", src)
+	}
+}
+
 // -- End-to-end with in-memory MCP transport -- //
 
 func TestConnectAndListTools_InMemory(t *testing.T) {

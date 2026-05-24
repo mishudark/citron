@@ -203,3 +203,65 @@ func extractErrorText(result *mcp.CallToolResult) string {
 	}
 	return "tool returned an error (no details)"
 }
+
+// ReadResourceResultToStarlark converts an MCP ReadResourceResult into a
+// starlark.Value.
+//
+// Rules:
+//   - nil or empty contents → starlark.None
+//   - Single text resource → starlark.String
+//   - Multiple resources → *starlark.List of strings
+func ReadResourceResultToStarlark(result *mcp.ReadResourceResult) (starlark.Value, error) {
+	if result == nil || len(result.Contents) == 0 {
+		return starlark.None, nil
+	}
+	if len(result.Contents) == 1 {
+		return resourceContentToStarlark(result.Contents[0])
+	}
+	items := make([]starlark.Value, len(result.Contents))
+	for i, c := range result.Contents {
+		s, err := resourceContentToStarlark(c)
+		if err != nil {
+			s = starlark.String(fmt.Sprintf("<error: %v>", err))
+		}
+		items[i] = s
+	}
+	return starlark.NewList(items), nil
+}
+
+func resourceContentToStarlark(rc *mcp.ResourceContents) (starlark.Value, error) {
+	if rc.Text != "" {
+		return starlark.String(rc.Text), nil
+	}
+	if len(rc.Blob) > 0 {
+		return starlark.String(string(rc.Blob)), nil
+	}
+	return starlark.None, nil
+}
+
+// GetPromptResultToStarlark converts an MCP GetPromptResult into a
+// starlark.Value.
+//
+// Each message is converted to a starlark.Dict with keys "role" and "content".
+// The result is a *starlark.List of such dicts.
+func GetPromptResultToStarlark(result *mcp.GetPromptResult) (starlark.Value, error) {
+	if result == nil || len(result.Messages) == 0 {
+		return starlark.None, nil
+	}
+	items := make([]starlark.Value, len(result.Messages))
+	for i, m := range result.Messages {
+		msg := starlark.NewDict(2)
+		if err := msg.SetKey(starlark.String("role"), starlark.String(string(m.Role))); err != nil {
+			return nil, err
+		}
+		content, err := singleContentToStarlark(m.Content)
+		if err != nil {
+			return nil, err
+		}
+		if err := msg.SetKey(starlark.String("content"), content); err != nil {
+			return nil, err
+		}
+		items[i] = msg
+	}
+	return starlark.NewList(items), nil
+}

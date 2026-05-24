@@ -112,7 +112,7 @@ go run examples/06_citron_harness.go
 |---------|---------|
 | [`caps/`](caps/) | Capability library  `FileSystem`, `Classified[T]`, `ProcessPermission`, `Network`, `IOCapability` |
 | [`analysis/`](analysis/) | Starlark AST-based static analyzer  `Classified.map` purity checks |
-| [`mcpclient/`](mcpclient/) | Remote MCP client  connect, list tools, generate Starlark capability bindings |
+| [`mcpclient/`](mcpclient/) | Remote MCP client  connect, list tools/resources/prompts, generate Starlark bindings or server proxy registrations |
 | `citron.go` | Top-level API  `SafeExecute`, `Session` |
 | `starlark_bindings.go` | Wraps capabilities into Starlark Builtins |
 | [`examples/`](examples/) | Runnable examples from the paper |
@@ -263,6 +263,58 @@ documentation comments, and `StructuredContent` that conforms to the tool's
 `OutputSchema` is automatically converted to native Starlark types (`dict`, `list`,
 `string`, `int`, `float`, `bool`) rather than raw JSON strings.
 
+### Proxying remote tools through the citron MCP server  `--server`
+
+The `--server` flag generates MCP **server registration** code instead of Starlark
+bindings.  Each remote tool is registered as a local `mcp.Tool` that proxies all
+calls to the remote MCP session, and the generated function returns
+`[]mcpclient.CapabilityInfo` entries that feed into the `list_capabilities` tool.
+
+```bash
+# Generate server registration code from a remote MCP server
+go run ./cmd/mcpgen --server --url http://remote:9090/mcp --package main --output gen_remote.go
+
+# Stdio transport
+go run ./cmd/mcpgen --server --command "npx @modelcontextprotocol/server-everything" --output gen_remote.go
+```
+
+Integration in the citron server:
+
+```go
+import (
+    "github.com/mishudark/citron/cmd/citron"
+    "github.com/mishudark/citron/mcpclient"
+    "path/to/gen_remote"
+)
+
+func main() {
+    // Connect to the remote MCP server
+    session, _ := mcpclient.Connect(ctx, &mcpclient.Config{
+        Transport: mcpclient.TransportStreamableHTTP,
+        ServerURL: "http://remote:9090/mcp",
+    })
+
+    // Create the citron server and register remote tools as proxy tools
+    server := citron.NewServer(opts,
+        gen_remote.RegisterRemoteTools(server, session)...,
+    )
+}
+```
+
+The registered tools appear in `list_capabilities` alongside the built-in `fs`,
+`net`, `proc`, `io`, and `Classified` capabilities.
+
+### All capabilities  `--all-caps`
+
+The `--all-caps` flag (combined with the default Starlark mode) also lists
+**resources** and **prompts** from the remote MCP server, generating Starlark
+builtins for reading resources (`get_<name>`) and retrieving prompts
+(`<prompt_name>`) alongside the tool builtins.
+
+```bash
+go run ./cmd/mcpgen --all-caps --url http://localhost:9090/mcp --package mytools
+```
+
 ## MCP Server — citron as a Service
 
 The [`cmd/citron/`](cmd/citron/) package runs an MCP server that exposes the
@@ -289,7 +341,11 @@ PORT=9090 go run ./cmd/citron
 | `harness_guide` | Returns the full HARNESS_GUIDE.md. Call this first. |
 | `execute_starlark` | Executes Starlark code through `citron.SafeExecute` with full safety guarantees. |
 | `analyze_starlark` | Static analysis without execution — returns structured issues. |
-| `list_capabilities` | Lists every capability (`fs`, `net`, `proc`, `io`, `Classified`) with methods and examples. |
+| `list_capabilities` | Lists every capability — built-in (`fs`, `net`, `proc`, `io`, `Classified`) and any remote MCP tools registered via `mcpgen --server`. |
+
+Remote MCP tools are registered as proxy tools alongside the built-in ones.
+See the [`--server` flag](#proxying-remote-tools-through-the-citron-mcp-server---server)
+section above.
 
 ### Resource
 
