@@ -13,6 +13,11 @@ import (
 
 	"github.com/mishudark/citron/analysis"
 	"github.com/mishudark/citron/caps"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/stdout/stdoutmetric"
+	"go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/trace"
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
 )
@@ -36,6 +41,26 @@ type Options struct {
 	ClassifiedPatterns []string
 	SecureOutputPath   string
 	TimeoutMs          int64
+
+	// TracerProvider sets the OpenTelemetry tracer provider for
+	// capability spans. When nil, the global OTel tracer is used.
+	TracerProvider trace.TracerProvider
+
+	// MeterProvider sets the OpenTelemetry meter provider for
+	// capability metrics. When nil, the global OTel meter is used.
+	MeterProvider metric.MeterProvider
+
+	// DoNotTrack disables all OpenTelemetry tracing and metrics
+	// collection for this execution or session. When true, no
+	// telemetry data is exported regardless of TracerProvider
+	// or MeterProvider settings.
+	DoNotTrack bool
+
+	// MetricsOutputPath is an optional file path for writing
+	// OpenTelemetry metrics after execution completes. When set,
+	// metrics are exported in JSON format to this file. Taking
+	// precedence over MeterProvider when both are set.
+	MetricsOutputPath string
 }
 
 type Result struct {
@@ -83,8 +108,64 @@ func vfsWorkingDir(opts Options) string {
 	return "/work"
 }
 
+// applyTelemetry configures the caps package telemetry providers based on
+// the provided options. When DoNotTrack is true, noop providers are used
+// regardless of any TracerProvider or MeterProvider settings.
+// Returns a function that flushes any pending metric data (no-op if no SDK
+// provider was created).
+func applyTelemetry(opts Options) func() {
+	if opts.DoNotTrack {
+		caps.SetNoopTelemetry()
+		return func() {}
+	}
+
+	if opts.TracerProvider != nil {
+		caps.SetTracerProvider(opts.TracerProvider)
+	}
+	if opts.MeterProvider != nil {
+		caps.SetMeterProvider(opts.MeterProvider)
+	}
+
+	// When a metrics output path is set, create an SDK meter provider
+	// that writes metrics to the specified file.
+	if opts.MetricsOutputPath != "" {
+		f, err := os.Create(opts.MetricsOutputPath)
+		if err != nil {
+			// If the file can't be created, fall back to the configured provider.
+			return func() {}
+		}
+		exporter, err := stdoutmetric.New(stdoutmetric.WithWriter(f))
+		if err != nil {
+			_ = f.Close()
+			return func() {}
+		}
+		reader := sdkmetric.NewPeriodicReader(exporter)
+		provider := sdkmetric.NewMeterProvider(
+			sdkmetric.WithReader(reader),
+		)
+		caps.SetMeterProvider(provider)
+		return func() {
+			_ = provider.ForceFlush(context.Background())
+			_ = provider.Shutdown(context.Background())
+			_ = f.Close()
+		}
+	}
+
+	return func() {}
+}
+
 func SafeExecute(code string, opts Options) (*Result, error) {
+	flushMetrics := applyTelemetry(opts)
+	defer flushMetrics()
+
+	_, span := caps.StartSpan(context.Background(), "citron.SafeExecute",
+		attribute.String("working_dir", vfsWorkingDir(opts)),
+		attribute.Bool("has_seed", opts.SeedDir != ""),
+	)
+
 	if err := Analyze(code); err != nil {
+		caps.EndSpan(span, err)
+		caps.RecordOperation(context.Background(), "safe_execute", err)
 		return nil, err
 	}
 
@@ -94,6 +175,8 @@ func SafeExecute(code string, opts Options) (*Result, error) {
 	if opts.SecureOutputPath != "" {
 		f, err := os.OpenFile(opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
+			caps.EndSpan(span, err)
+			caps.RecordOperation(context.Background(), "safe_execute", err)
 			return nil, err
 		}
 		defer func() { _ = f.Close() }()
@@ -111,6 +194,8 @@ func SafeExecute(code string, opts Options) (*Result, error) {
 	wd := vfsWorkingDir(opts)
 	if opts.SeedDir != "" {
 		if err := seedVirtualFS(vfs, wd, opts.SeedDir); err != nil {
+			caps.EndSpan(span, err)
+			caps.RecordOperation(context.Background(), "safe_execute", err)
 			return nil, fmt.Errorf("seed: %w", err)
 		}
 	}
@@ -149,13 +234,19 @@ func SafeExecute(code string, opts Options) (*Result, error) {
 	select {
 	case execErr = <-done:
 	case <-ctx.Done():
+		caps.EndSpan(span, fmt.Errorf("execution timed out after %dms", opts.TimeoutMs))
+		caps.RecordOperation(context.Background(), "safe_execute", fmt.Errorf("execution timed out after %dms", opts.TimeoutMs))
 		return nil, fmt.Errorf("execution timed out after %dms", opts.TimeoutMs)
 	}
 
 	if execErr != nil {
+		caps.EndSpan(span, execErr)
+		caps.RecordOperation(context.Background(), "safe_execute", execErr)
 		return nil, execErr
 	}
 
+	caps.EndSpan(span, nil)
+	caps.RecordOperation(context.Background(), "safe_execute", nil)
 	return &Result{
 		Output:   agentOut.String(),
 		Duration: time.Since(start).Milliseconds(),
@@ -169,6 +260,18 @@ type Session struct {
 }
 
 func NewSession(opts Options) *Session {
+	// Apply non-file telemetry config at session creation time.
+	// File-based metric export (MetricsOutputPath) is handled per Execute call.
+	if opts.DoNotTrack {
+		caps.SetNoopTelemetry()
+	} else {
+		if opts.TracerProvider != nil {
+			caps.SetTracerProvider(opts.TracerProvider)
+		}
+		if opts.MeterProvider != nil {
+			caps.SetMeterProvider(opts.MeterProvider)
+		}
+	}
 	vfs := caps.NewVirtualFileSystem()
 	wd := vfsWorkingDir(opts)
 	if opts.SeedDir != "" {
@@ -182,7 +285,17 @@ func NewSession(opts Options) *Session {
 }
 
 func (s *Session) Execute(code string) (*Result, error) {
+	flushMetrics := applyTelemetry(s.opts)
+	defer flushMetrics()
+
+	_, span := caps.StartSpan(context.Background(), "citron.Session.Execute",
+		attribute.String("working_dir", vfsWorkingDir(s.opts)),
+		attribute.Bool("has_seed", s.opts.SeedDir != ""),
+	)
+
 	if err := Analyze(code); err != nil {
+		caps.EndSpan(span, err)
+		caps.RecordOperation(context.Background(), "session_execute", err)
 		return nil, err
 	}
 
@@ -192,6 +305,8 @@ func (s *Session) Execute(code string) (*Result, error) {
 	if s.opts.SecureOutputPath != "" {
 		f, err := os.OpenFile(s.opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
+			caps.EndSpan(span, err)
+			caps.RecordOperation(context.Background(), "session_execute", err)
 			return nil, err
 		}
 		defer func() { _ = f.Close() }()
@@ -241,13 +356,19 @@ func (s *Session) Execute(code string) (*Result, error) {
 	select {
 	case execErr = <-done:
 	case <-ctx.Done():
+		caps.EndSpan(span, fmt.Errorf("execution timed out after %dms", s.opts.TimeoutMs))
+		caps.RecordOperation(context.Background(), "session_execute", fmt.Errorf("execution timed out after %dms", s.opts.TimeoutMs))
 		return nil, fmt.Errorf("execution timed out after %dms", s.opts.TimeoutMs)
 	}
 
 	if execErr != nil {
+		caps.EndSpan(span, execErr)
+		caps.RecordOperation(context.Background(), "session_execute", execErr)
 		return nil, execErr
 	}
 
+	caps.EndSpan(span, nil)
+	caps.RecordOperation(context.Background(), "session_execute", nil)
 	return &Result{
 		Output:   agentOut.String(),
 		Duration: time.Since(start).Milliseconds(),

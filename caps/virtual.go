@@ -1,10 +1,13 @@
 package caps
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type VirtualFileSystem struct {
@@ -79,6 +82,12 @@ func RequestVirtualFileSystem[T any](
 	cfg *FileSystemConfig,
 	op func(FileSystem) (T, error),
 ) (T, error) {
+	_, span := StartSpan(context.Background(), "caps.VirtualFileSystem.Request",
+		attribute.String("root", root),
+	)
+	defer EndSpan(span, nil)
+	RecordRequest(context.Background(), "virtual_filesystem")
+
 	if cfg == nil {
 		cfg = &FileSystemConfig{}
 	}
@@ -92,7 +101,9 @@ func RequestVirtualFileSystem[T any](
 		valid: true,
 	}
 	defer func() { fs.valid = false }()
-	return op(fs)
+	result, err := op(fs)
+	EndSpan(span, err)
+	return result, err
 }
 
 func (fs *virtualFSImpl) Access(path string) (FileEntry, error) {

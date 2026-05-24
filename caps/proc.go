@@ -2,10 +2,13 @@ package caps
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type ProcessPermission interface {
@@ -22,6 +25,12 @@ func RequestExecPermission[T any](
 	commands []string,
 	op func(ProcessPermission) (T, error),
 ) (T, error) {
+	_, span := StartSpan(context.Background(), "caps.Process.Request",
+		attribute.StringSlice("commands", commands),
+	)
+	defer EndSpan(span, nil)
+	RecordRequest(context.Background(), "process")
+
 	cmdSet := make(map[string]bool, len(commands))
 	for _, c := range commands {
 		cmdSet[c] = true
@@ -31,7 +40,9 @@ func RequestExecPermission[T any](
 		valid:    true,
 	}
 	defer func() { p.valid = false }()
-	return op(p)
+	result, err := op(p)
+	EndSpan(span, err)
+	return result, err
 }
 
 func (p *procImpl) validate(command string) error {
@@ -52,11 +63,20 @@ func (p *procImpl) validate(command string) error {
 }
 
 func Exec(perm ProcessPermission, command string, args []string, opts ExecOptions) (ProcessResult, error) {
+	_, span := StartSpan(context.Background(), "caps.Process.Exec",
+		attribute.String("command", command),
+		attribute.StringSlice("args", args),
+	)
+
 	p, ok := perm.(*procImpl)
 	if !ok {
+		EndSpan(span, fmt.Errorf("cap: invalid ProcessPermission"))
+		RecordOperation(context.Background(), "exec", fmt.Errorf("cap: invalid ProcessPermission"))
 		return ProcessResult{}, fmt.Errorf("cap: invalid ProcessPermission")
 	}
 	if err := p.validate(command); err != nil {
+		EndSpan(span, err)
+		RecordOperation(context.Background(), "exec", err)
 		return ProcessResult{}, err
 	}
 	ctx := p
@@ -98,10 +118,14 @@ func Exec(perm ProcessPermission, command string, args []string, opts ExecOption
 		if exitErr, ok := runErr.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 		} else {
+			EndSpan(span, runErr)
+			RecordOperation(context.Background(), "exec", runErr)
 			return ProcessResult{}, runErr
 		}
 	}
 
+	EndSpan(span, nil)
+	RecordOperation(context.Background(), "exec", nil)
 	return ProcessResult{
 		ExitCode: exitCode,
 		Stdout:   stdout.String(),

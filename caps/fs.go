@@ -1,10 +1,13 @@
 package caps
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type FileSystem interface {
@@ -60,6 +63,12 @@ func RequestFileSystem[T any](
 	cfg *FileSystemConfig,
 	op func(FileSystem) (T, error),
 ) (T, error) {
+	_, span := StartSpan(context.Background(), "caps.FileSystem.Request",
+		attribute.String("root", root),
+	)
+	EndSpan(span, nil)
+	RecordRequest(context.Background(), "filesystem")
+
 	if cfg == nil {
 		cfg = &FileSystemConfig{}
 	}
@@ -77,7 +86,9 @@ func RequestFileSystem[T any](
 		cfg:   cfg,
 	}
 	defer func() { fs.valid = false }()
-	return op(fs)
+	result, err := op(fs)
+	EndSpan(span, err)
+	return result, err
 }
 
 func (fs *fsImpl) Access(path string) (FileEntry, error) {

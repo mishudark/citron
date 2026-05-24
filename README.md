@@ -117,6 +117,86 @@ go run examples/06_citron_harness.go
 | `starlark_bindings.go` | Wraps capabilities into Starlark Builtins |
 | [`examples/`](examples/) | Runnable examples from the paper |
 
+## Telemetry
+
+citron integrates OpenTelemetry tracing and metrics around every capability operation. All telemetry flows through the standard OTel export pipeline — nothing is exported by default unless a `MeterProvider` or `MetricsOutputPath` is configured.
+
+### Traces (Spans)
+
+| Span name | Emitted at |
+|---|---|
+| `citron.SafeExecute` | Top-level script execution |
+| `citron.Session.Execute` | Session-based script execution |
+| `caps.FileSystem.Request` / `caps.VirtualFileSystem.Request` | Capability grant |
+| `caps.Network.Request` | Capability grant |
+| `caps.Process.Request` | Capability grant |
+| `caps.Network.HTTPGet` / `caps.Network.HTTPPost` | Network operation |
+| `caps.Process.Exec` | Process execution |
+| `caps.LLM.Chat` / `caps.LLM.ChatClassified` | LLM call |
+
+Each span carries relevant attributes (root path, hosts, command, args) and records error status when the operation fails.
+
+### Metrics (Counters)
+
+| Metric | Tags | Description |
+|---|---|---|
+| `caps.requests` | `type` | Number of capability grants by type (filesystem, network, process, virtual_filesystem) |
+| `caps.operations` | `operation`, `status` | Number of capability operations by name and outcome (ok / error) |
+
+### Configuration
+
+Telemetry is configured through `citron.Options`:
+
+```go
+type Options struct {
+    // ...
+
+    // TracerProvider for OpenTelemetry spans.
+    TracerProvider trace.TracerProvider
+
+    // MeterProvider for OpenTelemetry metrics.
+    MeterProvider metric.MeterProvider
+
+    // DoNotTrack disables all telemetry collection.
+    DoNotTrack bool
+
+    // MetricsOutputPath writes JSON metrics to a file after execution.
+    MetricsOutputPath string
+}
+```
+
+### Usage patterns
+
+**File export (simplest — no SDK setup needed):**
+```go
+result, err := citron.SafeExecute(code, citron.Options{
+    MetricsOutputPath: "metrics.json",
+})
+```
+
+**Custom MeterProvider (OTLP, Prometheus, etc.):**
+```go
+import (
+    "go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+    sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+)
+
+exporter, _ := otlpmetrichttp.New(ctx)
+reader := sdkmetric.NewPeriodicReader(exporter)
+provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+result, err := citron.SafeExecute(code, citron.Options{
+    MeterProvider: provider,
+})
+```
+
+**Opt out entirely:**
+```go
+result, err := citron.SafeExecute(code, citron.Options{
+    DoNotTrack: true,
+})
+```
+
 ## Remote MCP Tools as Capabilities  [`mcpclient`](mcpclient/)
 
 The [`mcpclient`](mcpclient/) package connects to a remote MCP server, lists its tools
