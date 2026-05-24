@@ -175,26 +175,30 @@ func TestSessionExecuteWithExtras(t *testing.T) {
 // -- Runtime error (passes analysis, fails at execution) -- //
 
 func TestSafeExecuteRuntimeError(t *testing.T) {
-	// Division by zero is syntactically valid — analysis passes.
 	_, err := SafeExecute(`x = 1 // 0`, Options{})
 	if err == nil {
 		t.Fatal("expected runtime error")
 	}
-	t.Logf("runtime error: %v", err)
-	if !strings.Contains(err.Error(), "zero") && !strings.Contains(err.Error(), "division") {
-		t.Fatalf("error should describe the runtime failure, got: %v", err)
+	t.Logf("runtime error:\n%v", err)
+	if !strings.Contains(err.Error(), "Traceback") {
+		t.Fatalf("error should contain traceback, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "agent.star:1") {
+		t.Fatalf("error should contain source location, got: %v", err)
 	}
 }
 
 func TestSafeExecuteTypeError(t *testing.T) {
-	// Type error at runtime (passes analysis).
 	_, err := SafeExecute(`x = "hello" + 42`, Options{})
 	if err == nil {
 		t.Fatal("expected runtime error")
 	}
-	t.Logf("type error: %v", err)
-	if !strings.Contains(err.Error(), "binary op") {
-		t.Fatalf("error should describe type mismatch, got: %v", err)
+	t.Logf("type error:\n%v", err)
+	if !strings.Contains(err.Error(), "Traceback") {
+		t.Fatalf("error should contain traceback, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "agent.star:1") {
+		t.Fatalf("error should contain source location, got: %v", err)
 	}
 }
 
@@ -216,12 +220,14 @@ result = secret.map(lambda s: (io.println(s), s.upper())[1])
 	if runtimeErr == nil {
 		t.Fatal("expected runtime error")
 	}
-	t.Logf("RUNTIME error:   %v", runtimeErr)
+	t.Logf("RUNTIME error:\n%v", runtimeErr)
 
-	// They look different:
-	// analysis: "agent.star:4:32: call to potentially impure method 'println'..."
-	// runtime:  "agent.star:1:9: Starlark eval error: division by zero\nTraceback..."
-	if analysisErr.Error() == runtimeErr.Error() {
-		t.Fatal("analysis and runtime errors should differ")
+	// Analysis: structured with rule code, no traceback.
+	if strings.Contains(analysisErr.Error(), "Traceback") {
+		t.Fatal("analysis error should NOT contain traceback")
+	}
+	// Runtime: has traceback with call stack.
+	if !strings.Contains(runtimeErr.Error(), "Traceback") {
+		t.Fatal("runtime error SHOULD contain traceback")
 	}
 }

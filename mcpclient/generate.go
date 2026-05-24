@@ -221,7 +221,7 @@ type genResource struct {
 	URI         string
 	MIMEType    string
 	// FuncNameG is the Starlark builtin name for reading this resource.
-	FuncName    string
+	FuncName string
 }
 
 type genPrompt struct {
@@ -299,7 +299,7 @@ func buildMethodsString(name string, propNames []string, schema map[string]any) 
 						if j > 0 {
 							sb.WriteString("|")
 						}
-						sb.WriteString(fmt.Sprint(e))
+						fmt.Fprint(&sb, e)
 					}
 				}
 			} else {
