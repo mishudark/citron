@@ -2,11 +2,14 @@ package caps
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 type LLMConfig struct {
@@ -49,21 +52,38 @@ type chatResponse struct {
 }
 
 func Chat(message string) (string, error) {
+	_, span := StartSpan(context.Background(), "caps.LLM.Chat",
+		attribute.Int("message_len", len(message)),
+	)
+
 	if globalLLM == nil {
+		EndSpan(span, fmt.Errorf("cap: LLM not configured"))
+		RecordOperation(context.Background(), "chat", fmt.Errorf("cap: LLM not configured"))
 		return "", fmt.Errorf("cap: LLM not configured")
 	}
-	return globalLLM.chat(message)
+	result, err := globalLLM.chat(message)
+	EndSpan(span, err)
+	RecordOperation(context.Background(), "chat", err)
+	return result, err
 }
 
 func ChatClassified(message Classified[string]) (Classified[string], error) {
+	_, span := StartSpan(context.Background(), "caps.LLM.ChatClassified")
+
 	if globalLLM == nil {
+		EndSpan(span, fmt.Errorf("cap: LLM not configured"))
+		RecordOperation(context.Background(), "chat_classified", fmt.Errorf("cap: LLM not configured"))
 		return Classified[string]{}, fmt.Errorf("cap: LLM not configured")
 	}
 	// Only pure functions can access the classified content
 	result, err := globalLLM.chat(message.value)
 	if err != nil {
+		EndSpan(span, err)
+		RecordOperation(context.Background(), "chat_classified", err)
 		return Classified[string]{}, err
 	}
+	EndSpan(span, nil)
+	RecordOperation(context.Background(), "chat_classified", nil)
 	return Classify(result), nil
 }
 
