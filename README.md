@@ -262,3 +262,66 @@ Generated code includes both **input** and **output** schema property names as
 documentation comments, and `StructuredContent` that conforms to the tool's
 `OutputSchema` is automatically converted to native Starlark types (`dict`, `list`,
 `string`, `int`, `float`, `bool`) rather than raw JSON strings.
+
+## MCP Server — citron as a Service
+
+The [`cmd/citron/`](cmd/citron/) package runs an MCP server that exposes the
+entire citron safety harness as MCP tools.  This follows the
+[code-execution-with-MCP](https://modelcontextprotocol.io) pattern described by
+Anthropic: instead of loading dozens of tool definitions into context, the
+agent learns the harness API via `harness_guide` and writes Starlark code that
+citron safely executes.
+
+### Quick start
+
+```bash
+# Stdio transport (default — pipe into your MCP client)
+go run ./cmd/citron
+
+# Streamable HTTP transport
+PORT=9090 go run ./cmd/citron
+```
+
+### Available tools
+
+| Tool | Description |
+|------|-------------|
+| `harness_guide` | Returns the full HARNESS_GUIDE.md. Call this first. |
+| `execute_starlark` | Executes Starlark code through `citron.SafeExecute` with full safety guarantees. |
+| `analyze_starlark` | Static analysis without execution — returns structured issues. |
+| `list_capabilities` | Lists every capability (`fs`, `net`, `proc`, `io`, `Classified`) with methods and examples. |
+
+### Resource
+
+The harness guide is also available as a readable resource at `citron://harness-guide.md`.
+
+### Environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `PORT` | HTTP port (default `8080`; set empty for stdio) |
+| `CITRON_COMMAND_ALLOWLIST` | Comma-separated allowed commands for `proc.exec` |
+| `CITRON_NETWORK_ALLOWLIST` | Comma-separated allowed hosts for `net.get` |
+| `CITRON_CLASSIFIED_PATTERNS` | Comma-separated glob patterns for classified files |
+| `CITRON_SECURE_OUTPUT_PATH` | Path for unmasked classified output |
+| `CITRON_TIMEOUT_MS` | Execution timeout (default `30000`) |
+
+### Usage with MCP clients
+
+The server works with any MCP client.  An agent connects, calls
+`harness_guide` or reads the `citron://harness-guide.md` resource, and then
+writes Starlark code that uses `fs`, `net`, `proc`, `io`, and `Classified`.
+
+```python
+# Example Starlark code the agent might write:
+f = fs.access("output.txt")
+f.write("safe agent output")
+io.println("Wrote to file")
+
+# With classified data:
+secret = fs.access("key.txt").read_classified()
+def to_upper(s):
+    return s.upper()
+upper = secret.map(to_upper)
+io.println(upper)  # prints "Classified(****)"
+```

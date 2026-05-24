@@ -12,7 +12,7 @@ import (
 func main() {
 	dir, _ := os.MkdirTemp("", "citron-example-*")
 	defer os.RemoveAll(dir)
-	os.WriteFile(dir+"/key.txt", []byte("my-secret-api-key-12345"), 0644)
+	os.WriteFile(dir+"/key.txt", []byte("my-secret-api-key-12345"), 0o644)
 
 	opts := citron.Options{
 		SeedDir:            dir,

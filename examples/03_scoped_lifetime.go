@@ -12,7 +12,7 @@ import (
 func main() {
 	dir, _ := os.MkdirTemp("", "citron-scope-*")
 	defer os.RemoveAll(dir)
-	os.WriteFile(dir+"/secret.txt", []byte("classified-content"), 0644)
+	os.WriteFile(dir+"/secret.txt", []byte("classified-content"), 0o644)
 
 	opts := citron.Options{
 		SeedDir:    dir,

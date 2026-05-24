@@ -173,7 +173,7 @@ func SafeExecute(code string, opts Options) (*Result, error) {
 
 	var secureOut *os.File
 	if opts.SecureOutputPath != "" {
-		f, err := os.OpenFile(opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		f, err := os.OpenFile(opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
 			caps.EndSpan(span, err)
 			caps.RecordOperation(context.Background(), "safe_execute", err)
@@ -303,7 +303,7 @@ func (s *Session) Execute(code string) (*Result, error) {
 
 	var secureOut *os.File
 	if s.opts.SecureOutputPath != "" {
-		f, err := os.OpenFile(s.opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		f, err := os.OpenFile(s.opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
 			caps.EndSpan(span, err)
 			caps.RecordOperation(context.Background(), "session_execute", err)

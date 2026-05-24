@@ -38,9 +38,9 @@ type FileEntry interface {
 
 type fsImpl struct {
 	capabilityMarker
-	root    string
-	valid   bool
-	cfg     *FileSystemConfig
+	root  string
+	valid bool
+	cfg   *FileSystemConfig
 }
 
 type FileSystemConfig struct {
@@ -192,7 +192,7 @@ func (e *fileEntryImpl) Write(content string) error {
 	if e.IsClassified() {
 		return fmt.Errorf("cap: Write() not allowed on classified path %q; use WriteClassified", e.path)
 	}
-	return os.WriteFile(e.path, []byte(content), 0644)
+	return os.WriteFile(e.path, []byte(content), 0o644)
 }
 
 func (e *fileEntryImpl) Append(content string) error {
@@ -202,7 +202,7 @@ func (e *fileEntryImpl) Append(content string) error {
 	if e.IsClassified() {
 		return fmt.Errorf("cap: Append() not allowed on classified path %q", e.path)
 	}
-	f, err := os.OpenFile(e.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(e.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
@@ -262,7 +262,7 @@ func (e *fileEntryImpl) MkdirAll() error {
 	if err := e.checkValid(); err != nil {
 		return err
 	}
-	return os.MkdirAll(e.path, 0755)
+	return os.MkdirAll(e.path, 0o755)
 }
 
 func (e *fileEntryImpl) Children() ([]DirEntry, error) {
@@ -395,7 +395,7 @@ func (e *fileEntryImpl) WriteClassified(data Classified[string]) error {
 	if !e.IsClassified() {
 		return fmt.Errorf("cap: WriteClassified() only allowed on classified paths")
 	}
-	return os.WriteFile(e.path, []byte(data.value), 0644)
+	return os.WriteFile(e.path, []byte(data.value), 0o644)
 }
 
 func (e *fileEntryImpl) checkValid() error {

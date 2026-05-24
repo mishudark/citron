@@ -77,7 +77,7 @@ func FuzzClassifiedMapExpression(f *testing.F) {
 	f.Fuzz(func(t *testing.T, expr string) {
 		dir := t.TempDir()
 		classifiedPath := "classified.txt"
-		if err := os.WriteFile(filepath.Join(dir, classifiedPath), []byte(classifiedValue), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, classifiedPath), []byte(classifiedValue), 0o644); err != nil {
 			t.Skip(err)
 		}
 
@@ -91,7 +91,6 @@ func FuzzClassifiedMapExpression(f *testing.F) {
 			SeedDir:            dir,
 			ClassifiedPatterns: []string{"classified.txt"},
 		})
-
 		if err != nil {
 			errMsg := err.Error()
 			if strings.Contains(errMsg, classifiedValue) {
@@ -121,7 +120,7 @@ func FuzzClassifiedFlatMapExpression(f *testing.F) {
 	f.Fuzz(func(t *testing.T, expr string) {
 		dir := t.TempDir()
 		classifiedPath := "secret.txt"
-		if err := os.WriteFile(filepath.Join(dir, classifiedPath), []byte(classifiedValue), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, classifiedPath), []byte(classifiedValue), 0o644); err != nil {
 			t.Skip(err)
 		}
 
@@ -135,7 +134,6 @@ func FuzzClassifiedFlatMapExpression(f *testing.F) {
 			SeedDir:            dir,
 			ClassifiedPatterns: []string{"secret.txt"},
 		})
-
 		if err != nil {
 			errMsg := err.Error()
 			if strings.Contains(errMsg, classifiedValue) {
@@ -177,7 +175,7 @@ func FuzzClassifiedValueFormat(f *testing.F) {
 			t.Skip("value too long")
 		}
 		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "key.txt"), []byte(classifiedValue), 0644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "key.txt"), []byte(classifiedValue), 0o644); err != nil {
 			t.Skip(err)
 		}
 
@@ -192,7 +190,6 @@ func FuzzClassifiedValueFormat(f *testing.F) {
 			SeedDir:            dir,
 			ClassifiedPatterns: []string{"key.txt"},
 		})
-
 		if err != nil {
 			errMsg := err.Error()
 			if strings.Contains(errMsg, classifiedValue) {
@@ -237,12 +234,12 @@ func FuzzPathSafety(f *testing.F) {
 		}
 		dir := t.TempDir()
 		workspace := dir + "/workspace"
-		if err := os.MkdirAll(workspace, 0755); err != nil {
+		if err := os.MkdirAll(workspace, 0o755); err != nil {
 			t.Skip(err)
 		}
 
 		// Create a classified file inside workspace
-		if err := os.WriteFile(workspace+"/classified.txt", []byte("TOP_SECRET"), 0644); err != nil {
+		if err := os.WriteFile(workspace+"/classified.txt", []byte("TOP_SECRET"), 0o644); err != nil {
 			t.Skip(err)
 		}
 
@@ -288,7 +285,7 @@ func FuzzSessionPersistence(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, turn1 string, turn2 string) {
 		dir := t.TempDir()
-		if err := os.WriteFile(dir+"/classified.txt", []byte(classifiedValue), 0644); err != nil {
+		if err := os.WriteFile(dir+"/classified.txt", []byte(classifiedValue), 0o644); err != nil {
 			t.Skip(err)
 		}
 

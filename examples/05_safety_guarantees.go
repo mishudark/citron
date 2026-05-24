@@ -12,7 +12,7 @@ import (
 func main() {
 	dir, _ := os.MkdirTemp("", "citron-leak-*")
 	defer os.RemoveAll(dir)
-	os.WriteFile(dir+"/.env", []byte("API_KEY=sk-1234567890abcdef"), 0644)
+	os.WriteFile(dir+"/.env", []byte("API_KEY=sk-1234567890abcdef"), 0o644)
 
 	opts := citron.Options{
 		SeedDir:            dir,

@@ -13,9 +13,9 @@ func main() {
 	dir, _ := os.MkdirTemp("", "citron-scenario-*")
 	defer os.RemoveAll(dir)
 
-	os.WriteFile(dir+"/contract_v1.txt", []byte("This agreement grants 20% equity vesting over 4 years with a 1-year cliff."), 0644)
-	os.WriteFile(dir+"/contract_v2.txt", []byte("This agreement grants 25% equity vesting over 3 years with a 6-month cliff."), 0644)
-	os.WriteFile(dir+"/summary_output.txt", []byte(""), 0644)
+	os.WriteFile(dir+"/contract_v1.txt", []byte("This agreement grants 20% equity vesting over 4 years with a 1-year cliff."), 0o644)
+	os.WriteFile(dir+"/contract_v2.txt", []byte("This agreement grants 25% equity vesting over 3 years with a 6-month cliff."), 0o644)
+	os.WriteFile(dir+"/summary_output.txt", []byte(""), 0o644)
 
 	opts := citron.Options{
 		SeedDir:            dir,

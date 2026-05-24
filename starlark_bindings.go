@@ -2,6 +2,7 @@ package citron
 
 import (
 	"fmt"
+
 	"github.com/mishudark/citron/caps"
 	"go.starlark.net/starlark"
 )
@@ -93,7 +94,9 @@ func (s *starlarkFileEntry) Attr(name string) (starlark.Value, error) {
 	}
 	return nil, nil
 }
-func (s *starlarkFileEntry) AttrNames() []string { return []string{"read", "write", "read_classified", "write_classified"} }
+func (s *starlarkFileEntry) AttrNames() []string {
+	return []string{"read", "write", "read_classified", "write_classified"}
+}
 
 // --- Classified Bindings ---
 
@@ -257,7 +260,7 @@ func (s *starlarkProc) Attr(name string) (starlark.Value, error) {
 			if err := starlark.UnpackArgs("exec", args, kwargs, "command", &command, "args?", &cmdArgs); err != nil {
 				return nil, err
 			}
-			
+
 			var strArgs []string
 			if cmdArgs != nil {
 				for i := 0; i < cmdArgs.Len(); i++ {
@@ -266,7 +269,7 @@ func (s *starlarkProc) Attr(name string) (starlark.Value, error) {
 					}
 				}
 			}
-			
+
 			out, err := caps.ExecOutput(s.p, command, strArgs)
 			if err != nil {
 				return nil, err
