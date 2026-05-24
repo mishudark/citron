@@ -1,8 +1,8 @@
 # citron  Tracked Capabilities for Safer Agents
 
-A Go implementation of the capability-safe agent framework from *[Tracking Capabilities for Safer Agents](paper.md)* (CAIS '26), adapted to use **Starlark (Python)** as the agent execution language.
+A Go implementation of the capability-safe agent framework from *[Tracking Capabilities for Safer Agents](https://arxiv.org/abs/2603.00991)* (CAIS '26), adapted to use **Starlark (Python)** as the agent execution language.
 
-> **citron** (pronounced /ˈsɪtrən/) is a safety harness for AI agents.
+> **citron** is a safety harness for AI agents.
 > Instead of calling tools directly, agents express their intentions as Starlark (Python) scripts
 > using **tracked capabilities**  global objects that regulate access to files, processes,
 > network, and I/O. The harness validates safety via AST analysis and evaluates the script natively.
@@ -119,7 +119,7 @@ go run examples/06_citron_harness.go
 
 ## Telemetry
 
-citron integrates OpenTelemetry tracing and metrics around every capability operation. All telemetry flows through the standard OTel export pipeline — nothing is exported by default unless a `MeterProvider` or `MetricsOutputPath` is configured.
+citron integrates OpenTelemetry tracing and metrics around every capability operation. All telemetry flows through the standard OTel export pipeline nothing is exported by default unless a `MeterProvider` or `MetricsOutputPath` is configured.
 
 ### Traces (Spans)
 
@@ -168,7 +168,7 @@ type Options struct {
 
 ### Usage patterns
 
-**File export (simplest — no SDK setup needed):**
+**File export (simplest no SDK setup needed):**
 ```go
 result, err := citron.SafeExecute(code, citron.Options{
     MetricsOutputPath: "metrics.json",
@@ -316,7 +316,7 @@ builtins for reading resources (`get_<name>`) and retrieving prompts
 go run ./cmd/mcpgen --all-caps --url http://localhost:9090/mcp --package mytools
 ```
 
-## MCP Server — citron as a Service
+## MCP Server citron as a Service
 
 The [`cmd/citron/`](cmd/citron/) package runs an MCP server that exposes the
 entire citron safety harness as MCP tools.  This follows the
@@ -328,7 +328,7 @@ citron safely executes.
 ### Quick start
 
 ```bash
-# Stdio transport (default — pipe into your MCP client)
+# Stdio transport (default pipe into your MCP client)
 go run ./cmd/citron
 
 # Streamable HTTP transport
@@ -341,8 +341,8 @@ PORT=9090 go run ./cmd/citron
 |------|-------------|
 | `harness_guide` | Returns the full HARNESS_GUIDE.md. Call this first. |
 | `execute_starlark` | Executes Starlark code through `citron.SafeExecute` with full safety guarantees. |
-| `analyze_starlark` | Static analysis without execution — returns structured issues. |
-| `list_capabilities` | Lists every capability — built-in (`fs`, `net`, `proc`, `io`, `Classified`) and any remote MCP tools registered via `mcpgen --server`. |
+| `analyze_starlark` | Static analysis without execution returns structured issues. |
+| `list_capabilities` | Lists every capability built-in (`fs`, `net`, `proc`, `io`, `Classified`) and any remote MCP tools registered via `mcpgen --server`. |
 
 Remote MCP tools are registered as proxy tools alongside the built-in ones.
 See the [`--server` flag](#proxying-remote-tools-through-the-citron-mcp-server---server)
