@@ -10,6 +10,17 @@ Every program you write must follow the rules below. The harness will reject uns
 You write **Starlark** code (a Python dialect). It is executed top-to-bottom.
 Capabilities are provided as global variables: `fs`, `io`, `net`, `proc`.
 
+Depending on server configuration, additional **remote MCP tools** may also be
+available as top-level globals (e.g. `get_weather`, `search`).  These proxy to
+an external MCP server and behave like regular functions — call them with keyword
+arguments and they return results as Starlark values.
+
+```python
+# Remote MCP tools (if configured — call list_capabilities to discover)
+result = get_weather(location="New York", units="celsius")
+io.println(result)
+```
+
 The filesystem is an **in-memory virtual filesystem** — there is no access to the host disk.
 Files are seeded before execution via `SeedDir` (if configured); all agent-created files exist
 only within the virtual sandbox and are discarded when execution ends.
@@ -54,7 +65,7 @@ io.println(result)
 
 | Method | Returns | Notes |
 |--------|---------|-------|
-| `exec(cmd, args)` | `string` | Returns stdout. Commands are restricted to the configured allowlist. |
+| `exec(cmd, args)` | `string` | Returns stdout. Commands are restricted to the configured allowlist. Passing `Classified` values produces a type error at runtime. |
 
 ### 2c. Network Access (`net`)
 
@@ -65,7 +76,7 @@ io.println(body)
 
 | Method | Returns | Notes |
 |--------|---------|-------|
-| `get(url)` | `string` | Host validated against allowlist. Redirect targets are re-checked. |
+| `get(url)` | `string` | Host validated against allowlist. Redirect targets are re-checked. Passing a `Classified` value produces a type error at runtime. |
 
 ---
 
@@ -135,4 +146,51 @@ io.println("hello", 42)    # agent sees: "hello 42"
 print("hello", 42)         # same — routed through io gate
 io.println(secret)          # agent sees: Classified(****)
 ```
+
+---
+
+## 5. Error Handling
+
+Errors come in two forms, distinguished by their format:
+
+### Analysis errors (caught before execution)
+
+The static analyzer rejects unsafe code **before running it**.  These errors
+include the error code in parentheses:
+
+```
+agent.star:4:32: call to potentially impure method 'println' inside
+pure callback is forbidden (IMPURE_METHOD_CALL)
+```
+
+These always point to the exact line and column of the violation.  Fix the
+offending code and retry.
+
+### Runtime errors (pass analysis, crash during execution)
+
+Code that passes static analysis can still fail at runtime (division by zero,
+type errors, network timeouts, etc.).  These return a **traceback** showing
+the call stack:
+
+```
+agent.star: floating-point division by zero
+Traceback (most recent call last):
+  agent.star:1:7: in <toplevel>
+Error: floating-point division by zero
+```
+
+The first line repeats the error message. The traceback shows the file, line,
+and column of the failing expression and every enclosing function call.
+If your code uses remote MCP tools, errors from the remote server are
+wrapped in `"mcp tool <name>: <error>"`.
+
+### Common runtime mistakes
+
+| Mistake | Error message |
+|---------|--------------|
+| Passing `Classified` to `net.get()` | `"for parameter url: got Classified, want string"` |
+| Passing `Classified` to `proc.exec()` | `"for parameter command: got Classified, want string"` |
+| Division by zero | `"floored division by zero"` |
+| Type mismatch (`"hello" + 42`) | `"unknown binary op: string + int"` |
+| Calling an undefined variable | `"undefined: <name>"` |
 
