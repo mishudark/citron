@@ -40,6 +40,80 @@ func Analyze(filename string, code []byte) ([]Issue, error) {
 	classifiedVars := buildClassifiedVarSet(f.Stmts)
 
 	syntax.Walk(f, func(n syntax.Node) bool {
+		// Check for shadowing of pure builtins
+		switch node := n.(type) {
+		case *syntax.AssignStmt:
+			syntax.Walk(node.LHS, func(lhsNode syntax.Node) bool {
+				if id, ok := lhsNode.(*syntax.Ident); ok {
+					if pureBuiltins[id.Name] {
+						start, _ := node.Span()
+						issues = append(issues, Issue{
+							Pos:     start,
+							Code:    "SHADOWED_PURE_BUILTIN",
+							Message: fmt.Sprintf("cannot shadow pure builtin '%s'", id.Name),
+						})
+					}
+				}
+				return true
+			})
+		case *syntax.DefStmt:
+			if pureBuiltins[node.Name.Name] {
+				start, _ := node.Span()
+				issues = append(issues, Issue{
+					Pos:     start,
+					Code:    "SHADOWED_PURE_BUILTIN",
+					Message: fmt.Sprintf("cannot shadow pure builtin '%s'", node.Name.Name),
+				})
+			}
+		case *syntax.ForStmt:
+			syntax.Walk(node.Vars, func(varNode syntax.Node) bool {
+				if id, ok := varNode.(*syntax.Ident); ok {
+					if pureBuiltins[id.Name] {
+						start, _ := node.Span()
+						issues = append(issues, Issue{
+							Pos:     start,
+							Code:    "SHADOWED_PURE_BUILTIN",
+							Message: fmt.Sprintf("cannot shadow pure builtin '%s'", id.Name),
+						})
+					}
+				}
+				return true
+			})
+		case *syntax.Comprehension:
+			for _, clause := range node.Clauses {
+				if forClause, ok := clause.(*syntax.ForClause); ok {
+					syntax.Walk(forClause.Vars, func(varNode syntax.Node) bool {
+						if id, ok := varNode.(*syntax.Ident); ok {
+							if pureBuiltins[id.Name] {
+								start, _ := node.Span()
+								issues = append(issues, Issue{
+									Pos:     start,
+									Code:    "SHADOWED_PURE_BUILTIN",
+									Message: fmt.Sprintf("cannot shadow pure builtin '%s'", id.Name),
+								})
+							}
+						}
+						return true
+					})
+				}
+			}
+		case *syntax.LoadStmt:
+			for i, to := range node.To {
+				name := to.Name
+				if name == "" {
+					name = node.From[i].Name
+				}
+				if pureBuiltins[name] {
+					start, _ := node.Span()
+					issues = append(issues, Issue{
+						Pos:     start,
+						Code:    "SHADOWED_PURE_BUILTIN",
+						Message: fmt.Sprintf("cannot shadow pure builtin '%s' via load", name),
+					})
+				}
+			}
+		}
+
 		call, ok := n.(*syntax.CallExpr)
 		if !ok {
 			return true

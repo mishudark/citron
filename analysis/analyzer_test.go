@@ -119,3 +119,85 @@ f.write(content)
 		})
 	}
 }
+
+func TestAnalyzeShadowing(t *testing.T) {
+	tests := []struct {
+		name      string
+		code      string
+		wantIssue bool
+	}{
+		{
+			name: "shadowing via assignment",
+			code: `
+max = lambda x: x
+`,
+			wantIssue: true,
+		},
+		{
+			name: "shadowing via def",
+			code: `
+def len(x): pass
+`,
+			wantIssue: true,
+		},
+		{
+			name: "shadowing via for loop",
+			code: `
+for min in [1, 2, 3]:
+	pass
+`,
+			wantIssue: true,
+		},
+		{
+			name: "shadowing via list comprehension",
+			code: `
+x = [1 for abs in [1, 2, 3]]
+`,
+			wantIssue: true,
+		},
+		{
+			name: "shadowing via load",
+			code: `
+load("module.star", max="foo")
+`,
+			wantIssue: true,
+		},
+		{
+			name: "shadowing via direct load",
+			code: `
+load("module.star", "max")
+`,
+			wantIssue: true,
+		},
+		{
+			name: "no shadowing",
+			code: `
+my_max = lambda x: x
+`,
+			wantIssue: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issues, err := Analyze("test.star", []byte(tt.code))
+			if err != nil {
+				t.Fatal(err)
+			}
+			hasIssue := false
+			for _, issue := range issues {
+				if issue.Code == "SHADOWED_PURE_BUILTIN" {
+					hasIssue = true
+					break
+				}
+			}
+			if hasIssue != tt.wantIssue {
+				if tt.wantIssue {
+					t.Fatalf("expected SHADOWED_PURE_BUILTIN issue, got none")
+				} else {
+					t.Fatalf("expected no issues, got %v", issues)
+				}
+			}
+		})
+	}
+}
