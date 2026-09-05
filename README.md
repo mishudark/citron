@@ -231,6 +231,13 @@ result, err := citron.SafeExecute(code, citron.Options{
 
 Commands outside the allowlist are rejected. The Starlark binding returns stdout as a string. Passing a `Classified` value to `proc.exec` is a type error at runtime, so secrets cannot be smuggled into a command line.
 
+For commands whose *output* may contain secrets, `proc.exec_classified` wraps stdout and stderr in `Classified` (statically enforced: the result cannot flow into plain capability calls), while `.exit_code` stays a plain int:
+
+```python
+out = proc.exec_classified("printenv", [])
+io.println(out.stdout)   # "Classified(****)"
+```
+
 The Go API exposes the full `Exec`/`ExecOutput` signatures, including working directory and timeout, inside the scoped `RequestExecPermission` callback:
 
 ```go
@@ -286,7 +293,7 @@ print("same gate", 42)
 
 When a secure output sink is configured via `SecureOutputPath`, `io.println` writes the **unmasked** classified content to that sink and `"Classified(****)"` to the agent-visible output.
 
-### LLM (`llm`): Go API only
+### LLM (`llm`)
 
 `caps.Chat` sends a message to the configured LLM, and `caps.ChatClassified` accepts and returns `Classified[string]`. Configure a backend first:
 
@@ -320,6 +327,8 @@ caps.RequestFileSystem("/data/secrets", nil, func(fsys caps.FileSystem) (string,
     return "", err
 })
 ```
+
+Inside the Starlark sandbox the same backend is available as the `llm` global when `Options.LLM` is set: `llm.chat(message)` for plain chat and `llm.chat_classified(message=Classified)` to keep prompt and response inside the classified boundary.
 
 ## API
 
@@ -366,10 +375,11 @@ err := citron.Analyze(code)
 | `WorkingDir` | `string` | Virtual root for filesystem operations (default `/work`) |
 | `SeedDir` | `string` | Real directory to copy into the virtual filesystem before execution |
 | `CommandAllowlist` | `[]string` | Allowed commands for `proc.exec` |
-| `NetworkAllowlist` | `[]string` | Allowed hosts for `net.get` |
+| `NetworkAllowlist` | `[]string` | Allowed hosts for `net.get`/`net.post` |
 | `ClassifiedPatterns` | `[]string` | Glob patterns for classified file paths |
-| `SecureOutputPath` | `string` | File path for unmasked classified output |
+| `SecureOutputPath` | `string` | File path for unmasked classified output (must be outside `WorkingDir`) |
 | `TimeoutMs` | `int64` | Execution timeout in milliseconds |
+| `LLM` | `*caps.LLMConfig` | Configures the `llm` global (`chat`, `chat_classified`); nil disables it |
 | `Extras` | `starlark.StringDict` | Additional Starlark globals (e.g. MCP tool bindings) |
 | `DoNotTrack` | `bool` | Disable all OpenTelemetry collection |
 | `TracerProvider` | `trace.TracerProvider` | Custom OTel tracer provider |

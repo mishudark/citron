@@ -10,6 +10,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -49,6 +50,10 @@ type Options struct {
 	SecureOutputPath   string
 	TimeoutMs          int64
 
+	// LLM optionally configures the llm global (chat, chat_classified).
+	// When nil, scripts referencing llm get a runtime error.
+	LLM *caps.LLMConfig
+
 	// TracerProvider sets the OpenTelemetry tracer provider for
 	// capability spans. When nil, the global OTel tracer is used.
 	TracerProvider trace.TracerProvider
@@ -79,6 +84,9 @@ type Options struct {
 type Result struct {
 	Output   string
 	Duration int64
+	// Audit lists the classified-data operations performed during this
+	// execution (reads, writes, unmasks), without any classified content.
+	Audit []caps.AuditEvent
 }
 
 func Analyze(code string) error {
@@ -102,6 +110,31 @@ func validateExtras(extras starlark.StringDict) error {
 		if analysis.IsPureBuiltin(name) {
 			return fmt.Errorf("citron: extras global %q shadows the pure builtin %q; rename the remote tool", name, name)
 		}
+	}
+	return nil
+}
+
+// validateSecureOutputPath rejects secure sinks that live inside the
+// working directory: the agent could fs.read() the plaintext unmasked output
+// back, defeating the masking gate.
+func validateSecureOutputPath(securePath, workingDir string) error {
+	if securePath == "" || workingDir == "" {
+		return nil
+	}
+	absSecure, err := filepath.Abs(securePath)
+	if err != nil {
+		return nil
+	}
+	absWork, err := filepath.Abs(workingDir)
+	if err != nil {
+		return nil
+	}
+	rel, err := filepath.Rel(absWork, absSecure)
+	if err != nil {
+		return nil
+	}
+	if rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel)) {
+		return fmt.Errorf("citron: SecureOutputPath %q is inside WorkingDir %q; the agent could read the unmasked output back", securePath, workingDir)
 	}
 	return nil
 }
@@ -215,6 +248,14 @@ func SafeExecute(code string, opts Options) (*Result, error) {
 
 	start := time.Now()
 
+	auditStart := caps.AuditLen()
+
+	if err := validateSecureOutputPath(opts.SecureOutputPath, vfsWorkingDir(opts)); err != nil {
+		caps.EndSpan(span, err)
+		caps.RecordOperationWithKind(context.Background(), "safe_execute", "setup", err)
+		return nil, err
+	}
+
 	var secureOut *os.File
 	if opts.SecureOutputPath != "" {
 		f, err := os.OpenFile(opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
@@ -223,15 +264,24 @@ func SafeExecute(code string, opts Options) (*Result, error) {
 			caps.RecordOperationWithKind(context.Background(), "safe_execute", "setup", err)
 			return nil, err
 		}
+		if err := f.Chmod(0o600); err != nil {
+			_ = f.Close()
+			caps.EndSpan(span, err)
+			caps.RecordOperationWithKind(context.Background(), "safe_execute", "setup", err)
+			return nil, err
+		}
 		defer func() { _ = f.Close() }()
 		secureOut = f
 	}
+
+	caps.ConfigureLLM(opts.LLM)
 
 	var agentOut bytes.Buffer
 	ioCap := caps.NewIOCapability(secureOut, &agentOut)
 
 	dict := starlark.StringDict{
-		"io": &starlarkIO{io: ioCap},
+		"io":  &starlarkIO{io: ioCap},
+		"llm": &starlarkLLM{},
 	}
 	// Extras can supply additional globals, but built-in capabilities
 	// always take precedence.
@@ -307,6 +357,7 @@ func SafeExecute(code string, opts Options) (*Result, error) {
 	return &Result{
 		Output:   agentOut.String(),
 		Duration: time.Since(start).Milliseconds(),
+		Audit:    caps.AuditEvents(auditStart),
 	}, nil
 }
 
@@ -368,6 +419,14 @@ func (s *Session) Execute(code string) (*Result, error) {
 
 	start := time.Now()
 
+	auditStart := caps.AuditLen()
+
+	if err := validateSecureOutputPath(s.opts.SecureOutputPath, vfsWorkingDir(s.opts)); err != nil {
+		caps.EndSpan(span, err)
+		caps.RecordOperationWithKind(context.Background(), "session_execute", "setup", err)
+		return nil, err
+	}
+
 	var secureOut *os.File
 	if s.opts.SecureOutputPath != "" {
 		f, err := os.OpenFile(s.opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
@@ -376,9 +435,17 @@ func (s *Session) Execute(code string) (*Result, error) {
 			caps.RecordOperationWithKind(context.Background(), "session_execute", "setup", err)
 			return nil, err
 		}
+		if err := f.Chmod(0o600); err != nil {
+			_ = f.Close()
+			caps.EndSpan(span, err)
+			caps.RecordOperationWithKind(context.Background(), "session_execute", "setup", err)
+			return nil, err
+		}
 		defer func() { _ = f.Close() }()
 		secureOut = f
 	}
+
+	caps.ConfigureLLM(s.opts.LLM)
 
 	var agentOut bytes.Buffer
 	ioCap := caps.NewIOCapability(secureOut, &agentOut)
@@ -392,6 +459,7 @@ func (s *Session) Execute(code string) (*Result, error) {
 	s.mu.Unlock()
 	maps.Copy(globals, s.opts.Extras)
 	globals["io"] = &starlarkIO{io: ioCap} // builtins take precedence
+	globals["llm"] = &starlarkLLM{}
 
 	var execErr error
 
@@ -422,7 +490,7 @@ func (s *Session) Execute(code string) (*Result, error) {
 					if errStar == nil {
 						for name, value := range resultDict {
 							switch name {
-							case "io", "fs", "net", "proc":
+							case "io", "fs", "net", "proc", "llm":
 								continue
 							}
 							globals[name] = value
@@ -456,7 +524,7 @@ func (s *Session) Execute(code string) (*Result, error) {
 	s.mu.Lock()
 	for name, value := range globals {
 		switch name {
-		case "io", "fs", "net", "proc":
+		case "io", "fs", "net", "proc", "llm":
 			continue
 		}
 		s.globals[name] = value
@@ -476,6 +544,7 @@ func (s *Session) Execute(code string) (*Result, error) {
 	return &Result{
 		Output:   agentOut.String(),
 		Duration: time.Since(start).Milliseconds(),
+		Audit:    caps.AuditEvents(auditStart),
 	}, nil
 }
 

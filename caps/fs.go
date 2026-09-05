@@ -414,9 +414,12 @@ func (e *fileEntryImpl) ReadClassified() (Classified[string], error) {
 		return Classified[string]{}, err
 	}
 	if !e.IsClassified() {
-		return Classified[string]{}, fmt.Errorf("cap: ReadClassified() only allowed on classified paths; %q is not classified", e.path)
+		err := fmt.Errorf("cap: ReadClassified() only allowed on classified paths; %q is not classified", e.path)
+		RecordAudit("read_classified", e.path, err)
+		return Classified[string]{}, err
 	}
 	data, err := os.ReadFile(e.path)
+	RecordAudit("read_classified", e.path, err)
 	if err != nil {
 		return Classified[string]{}, err
 	}
@@ -428,9 +431,13 @@ func (e *fileEntryImpl) WriteClassified(data Classified[string]) error {
 		return err
 	}
 	if !e.IsClassified() {
-		return fmt.Errorf("cap: WriteClassified() only allowed on classified paths")
+		err := fmt.Errorf("cap: WriteClassified() only allowed on classified paths")
+		RecordAudit("write_classified", e.path, err)
+		return err
 	}
-	return os.WriteFile(e.path, []byte(data.value), 0o600)
+	err := os.WriteFile(e.path, []byte(data.value), 0o600)
+	RecordAudit("write_classified", e.path, err)
+	return err
 }
 
 func (e *fileEntryImpl) checkValid() error {

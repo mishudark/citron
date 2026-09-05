@@ -252,10 +252,64 @@ func Analyze(filename string, code []byte) ([]Issue, error) {
 				})
 			}
 		}
+		if allowed, ok := classifiedArgPolicy[dot.Name.Name]; ok {
+			checkClassifiedArgs(call, allowed, classifiedVars, &issues)
+		}
 		return true
 	})
 
 	return issues, nil
+}
+
+// classifiedArgPolicy maps capability method names to the parameters that
+// are permitted to receive Classified data. Everything else (URLs, command
+// lines, process arguments) must stay unclassified: passing a Classified
+// value there would exfiltrate it. Runtime type checks are the last line of
+// defense; this makes the rejection static.
+var classifiedArgPolicy = map[string]map[string]bool{
+	"get":             {},
+	"get_classified":  {},
+	"post":            {},
+	"post_classified": {"body": true},
+	"exec":            {},
+	"exec_classified": {},
+}
+
+// classifiedBodyArgIndex is the positional index of the body parameter of
+// post_classified, the one position allowed to carry Classified data.
+const classifiedBodyArgIndex = 1
+
+func checkClassifiedArgs(call *syntax.CallExpr, allowed map[string]bool, classifiedVars map[string]bool, issues *[]Issue) {
+	start, _ := call.Span()
+	for i, arg := range call.Args {
+		if kw, ok := arg.(*syntax.BinaryExpr); ok && kw.Op == syntax.EQ {
+			name := ""
+			if id, ok := kw.X.(*syntax.Ident); ok {
+				name = id.Name
+			}
+			if allowed[name] {
+				continue
+			}
+			if exprProducesClassified(kw.Y, classifiedVars) {
+				*issues = append(*issues, Issue{
+					Pos:     start,
+					Code:    "CLASSIFIED_ARG",
+					Message: fmt.Sprintf("capability parameter '%s' must not receive Classified data", name),
+				})
+			}
+			continue
+		}
+		if i == classifiedBodyArgIndex && allowed["body"] {
+			continue
+		}
+		if exprProducesClassified(arg, classifiedVars) {
+			*issues = append(*issues, Issue{
+				Pos:     start,
+				Code:    "CLASSIFIED_ARG",
+				Message: "capability arguments must not be Classified data; unwrap via map first inside an approved sink",
+			})
+		}
+	}
 }
 
 // buildClassifiedVarSet walks the full AST in source order and tracks which
@@ -330,8 +384,11 @@ func exprProducesClassified(expr syntax.Expr, classifiedVars map[string]bool) bo
 	switch e := expr.(type) {
 	case *syntax.CallExpr:
 		if dot, ok := e.Fn.(*syntax.DotExpr); ok {
-			// .read_classified(), .map(), .flat_map() all return Classified.
-			if dot.Name.Name == "read_classified" || dot.Name.Name == "map" || dot.Name.Name == "flat_map" {
+			// .read_classified(), .map(), .flat_map() and the *_classified
+			// capability operations all return Classified values.
+			switch dot.Name.Name {
+			case "read_classified", "map", "flat_map",
+				"exec_classified", "get_classified", "post_classified", "chat_classified":
 				return true
 			}
 		}

@@ -269,6 +269,31 @@ func HTTPPost(netw Network, url, body, contentType string) (string, error) {
 	return respBody, nil
 }
 
+// HTTPGetClassified fetches a URL and wraps the response body in Classified,
+// for endpoints known to return sensitive data (metadata services, token
+// endpoints, ...). The body never enters the agent context in plain form.
+func HTTPGetClassified(netw Network, urlStr string) (Classified[string], error) {
+	body, err := HTTPGet(netw, urlStr)
+	RecordAudit("http_get_classified", urlStr, err)
+	if err != nil {
+		return Classified[string]{}, err
+	}
+	return Classify(body), nil
+}
+
+// HTTPPostClassified sends a Classified body to an allowlisted URL and
+// returns the response wrapped in Classified. It is the only way to send
+// classified data over the network: the body is accepted exclusively as a
+// Classified value, so plain call sites can never carry secrets.
+func HTTPPostClassified(netw Network, url string, body Classified[string], contentType string) (Classified[string], error) {
+	respBody, err := HTTPPost(netw, url, body.value, contentType)
+	RecordAudit("http_post_classified", url, err)
+	if err != nil {
+		return Classified[string]{}, err
+	}
+	return Classify(respBody), nil
+}
+
 func schemeOf(rawURL string) string {
 	if i := strings.Index(rawURL, "://"); i > 0 {
 		return rawURL[:i]

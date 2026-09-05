@@ -130,3 +130,17 @@ func ExecOutput(perm ProcessPermission, command string, args []string) (string, 
 	}
 	return strings.TrimSpace(result.Stdout), nil
 }
+
+// ExecClassified runs an allowlisted command and returns its output wrapped
+// in Classified, so command output that may contain secrets (environment
+// dumps, cloud CLI output, ...) never enters the agent context in plain
+// form. Stdout and stderr are both classified; unmask only inside a pure
+// transform or an approved sink.
+func ExecClassified(perm ProcessPermission, command string, args []string, opts ExecOptions) (Classified[ProcessResult], error) {
+	result, err := Exec(perm, command, args, opts)
+	RecordAudit("exec_classified", command, err)
+	if err != nil {
+		return Classified[ProcessResult]{}, err
+	}
+	return Classify(result), nil
+}
