@@ -84,3 +84,42 @@ func TestIsBlockedIP(t *testing.T) {
 		}
 	}
 }
+
+func TestExecClassifiedWrapsOutput(t *testing.T) {
+	_, err := RequestExecPermission([]string{"echo"}, func(p ProcessPermission) (any, error) {
+		c, err := ExecClassified(p, "echo", []string{"hello"}, ExecOptions{})
+		if err != nil {
+			t.Fatalf("ExecClassified: %v", err)
+		}
+		if got := c.String(); got != "Classified(****)" {
+			t.Fatalf("String() = %q, want masked", got)
+		}
+		unmasked, ok := c.unmask().(ProcessResult)
+		if !ok {
+			t.Fatalf("unmask returned %T", c.unmask())
+		}
+		if got := unmasked.Stdout; got != "hello\n" {
+			t.Fatalf("stdout = %q, want %q", got, "hello\n")
+		}
+		if unmasked.ExitCode != 0 {
+			t.Fatalf("exit code = %d, want 0", unmasked.ExitCode)
+		}
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("RequestExecPermission: %v", err)
+	}
+}
+
+func TestExecClassifiedRejectsNonAllowlisted(t *testing.T) {
+	_, err := RequestExecPermission([]string{"echo"}, func(p ProcessPermission) (any, error) {
+		_, err := ExecClassified(p, "printenv", nil, ExecOptions{})
+		return nil, err
+	})
+	if err == nil {
+		t.Fatal("expected allowlist error")
+	}
+	if !strings.Contains(err.Error(), "not in allowlist") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

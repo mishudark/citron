@@ -41,6 +41,14 @@ func Classify[T any](v T) Classified[T] {
 	return Classified[T]{value: v}
 }
 
+// Value returns the unmasked content. It is an escape hatch for trusted
+// harness code (Starlark bindings, sinks) that must move the value between
+// capability boundaries; the classified guarantees are enforced at the
+// sandbox and output layers, not here.
+func (c Classified[T]) Value() T {
+	return c.value
+}
+
 type unmasker interface {
 	unmask() any
 }

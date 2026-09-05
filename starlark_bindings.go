@@ -259,6 +259,51 @@ func (s *starlarkIO) Attr(name string) (starlark.Value, error) {
 }
 func (s *starlarkIO) AttrNames() []string { return []string{"println"} }
 
+// --- LLM Bindings ---
+
+type starlarkLLM struct{}
+
+func (s *starlarkLLM) String() string        { return "<LLM>" }
+func (s *starlarkLLM) Type() string          { return "LLM" }
+func (s *starlarkLLM) Freeze()               {}
+func (s *starlarkLLM) Truth() starlark.Bool  { return true }
+func (s *starlarkLLM) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable: LLM") }
+
+func (s *starlarkLLM) Attr(name string) (starlark.Value, error) {
+	switch name {
+	case "chat":
+		return starlark.NewBuiltin("chat", func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+			var message string
+			if err := starlark.UnpackArgs("chat", args, kwargs, "message", &message); err != nil {
+				return nil, err
+			}
+			reply, err := caps.Chat(message)
+			if err != nil {
+				return nil, err
+			}
+			return starlark.String(reply), nil
+		}), nil
+	case "chat_classified":
+		return starlark.NewBuiltin("chat_classified", func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+			var messageV starlark.Value
+			if err := starlark.UnpackArgs("chat_classified", args, kwargs, "message", &messageV); err != nil {
+				return nil, err
+			}
+			mc, ok := messageV.(*starlarkClassified)
+			if !ok {
+				return nil, fmt.Errorf("chat_classified: message must be Classified data; use chat for plain messages")
+			}
+			reply, err := caps.ChatClassified(mc.c)
+			if err != nil {
+				return nil, err
+			}
+			return &starlarkClassified{c: reply}, nil
+		}), nil
+	}
+	return nil, nil
+}
+func (s *starlarkLLM) AttrNames() []string { return []string{"chat", "chat_classified"} }
+
 // --- Network and Proc Bindings ---
 
 // Create starlark wrappers for HTTPGet, HTTPPost and Exec.
@@ -274,7 +319,8 @@ func (s *starlarkNetwork) Truth() starlark.Bool  { return true }
 func (s *starlarkNetwork) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable: Network") }
 
 func (s *starlarkNetwork) Attr(name string) (starlark.Value, error) {
-	if name == "get" {
+	switch name {
+	case "get":
 		return starlark.NewBuiltin("get", func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 			var url string
 			if err := starlark.UnpackArgs("get", args, kwargs, "url", &url); err != nil {
@@ -286,10 +332,55 @@ func (s *starlarkNetwork) Attr(name string) (starlark.Value, error) {
 			}
 			return starlark.String(body), nil
 		}), nil
+	case "get_classified":
+		return starlark.NewBuiltin("get_classified", func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+			var url string
+			if err := starlark.UnpackArgs("get_classified", args, kwargs, "url", &url); err != nil {
+				return nil, err
+			}
+			body, err := caps.HTTPGetClassified(s.n, url)
+			if err != nil {
+				return nil, err
+			}
+			return &starlarkClassified{c: body}, nil
+		}), nil
+	case "post":
+		return starlark.NewBuiltin("post", func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+			var url, body, contentType string
+			if err := starlark.UnpackArgs("post", args, kwargs, "url", &url, "body", &body, "content_type?", &contentType); err != nil {
+				return nil, err
+			}
+			resp, err := caps.HTTPPost(s.n, url, body, contentType)
+			if err != nil {
+				return nil, err
+			}
+			return starlark.String(resp), nil
+		}), nil
+	case "post_classified":
+		return starlark.NewBuiltin("post_classified", func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+			var url string
+			var bodyV starlark.Value
+			var contentType string
+			if err := starlark.UnpackArgs("post_classified", args, kwargs, "url", &url, "body", &bodyV, "content_type?", &contentType); err != nil {
+				return nil, err
+			}
+			sc, ok := bodyV.(*starlarkClassified)
+			if !ok {
+				return nil, fmt.Errorf("post_classified: body must be Classified data")
+			}
+			resp, err := caps.HTTPPostClassified(s.n, url, sc.c, contentType)
+			if err != nil {
+				return nil, err
+			}
+			return &starlarkClassified{c: resp}, nil
+		}), nil
 	}
 	return nil, nil
 }
-func (s *starlarkNetwork) AttrNames() []string { return []string{"get"} }
+
+func (s *starlarkNetwork) AttrNames() []string {
+	return []string{"get", "get_classified", "post", "post_classified"}
+}
 
 type starlarkProc struct {
 	p caps.ProcessPermission
@@ -302,7 +393,8 @@ func (s *starlarkProc) Truth() starlark.Bool  { return true }
 func (s *starlarkProc) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable: ProcessPermission") }
 
 func (s *starlarkProc) Attr(name string) (starlark.Value, error) {
-	if name == "exec" {
+	switch name {
+	case "exec":
 		return starlark.NewBuiltin("exec", func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 			var command string
 			var cmdArgs *starlark.List
@@ -327,7 +419,63 @@ func (s *starlarkProc) Attr(name string) (starlark.Value, error) {
 			}
 			return starlark.String(out), nil
 		}), nil
+	case "exec_classified":
+		return starlark.NewBuiltin("exec_classified", func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+			var command string
+			var cmdArgs *starlark.List
+			if err := starlark.UnpackArgs("exec_classified", args, kwargs, "command", &command, "args?", &cmdArgs); err != nil {
+				return nil, err
+			}
+
+			var strArgs []string
+			if cmdArgs != nil {
+				for i := 0; i < cmdArgs.Len(); i++ {
+					str, ok := starlark.AsString(cmdArgs.Index(i))
+					if !ok {
+						return nil, fmt.Errorf("exec_classified: args[%d] must be a string, got %s", i, cmdArgs.Index(i).Type())
+					}
+					strArgs = append(strArgs, str)
+				}
+			}
+
+			result, err := caps.ExecClassified(s.p, command, strArgs, caps.ExecOptions{})
+			if err != nil {
+				return nil, err
+			}
+			return &starlarkClassifiedProcess{c: result}, nil
+		}), nil
 	}
 	return nil, nil
 }
-func (s *starlarkProc) AttrNames() []string { return []string{"exec"} }
+func (s *starlarkProc) AttrNames() []string { return []string{"exec", "exec_classified"} }
+
+// starlarkClassifiedProcess wraps Classified[ProcessResult]. Its stdout and
+// stderr are surfaced as Classified values (transformable only via pure
+// map/flat_map); the exit code is not sensitive and is exposed as a plain int.
+type starlarkClassifiedProcess struct {
+	c caps.Classified[caps.ProcessResult]
+}
+
+func (s *starlarkClassifiedProcess) String() string       { return "Classified(ProcessResult)" }
+func (s *starlarkClassifiedProcess) Type() string         { return "ClassifiedProcess" }
+func (s *starlarkClassifiedProcess) Freeze()              {}
+func (s *starlarkClassifiedProcess) Truth() starlark.Bool { return true }
+func (s *starlarkClassifiedProcess) Hash() (uint32, error) {
+	return 0, fmt.Errorf("unhashable: ClassifiedProcess")
+}
+
+func (s *starlarkClassifiedProcess) Attr(name string) (starlark.Value, error) {
+	switch name {
+	case "stdout":
+		return &starlarkClassified{c: caps.Classify(s.c.Value().Stdout)}, nil
+	case "stderr":
+		return &starlarkClassified{c: caps.Classify(s.c.Value().Stderr)}, nil
+	case "exit_code":
+		return starlark.MakeInt(s.c.Value().ExitCode), nil
+	}
+	return nil, nil
+}
+
+func (s *starlarkClassifiedProcess) AttrNames() []string {
+	return []string{"stdout", "stderr", "exit_code"}
+}

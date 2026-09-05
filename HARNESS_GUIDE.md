@@ -66,6 +66,19 @@ io.println(result)
 | Method | Returns | Notes |
 |--------|---------|-------|
 | `exec(cmd, args)` | `string` | Returns stdout. Commands are restricted to the configured allowlist. Passing `Classified` values produces a type error at runtime. |
+| `exec_classified(cmd, args)` | `ClassifiedProcess` | stdout and stderr are wrapped in `Classified`; use when the command output may contain secrets (environment dumps, cloud CLIs). `.exit_code` is a plain int. |
+
+```python
+out = proc.exec_classified("printenv", [])
+io.println(out.stdout)          # Classified(****)
+def find_path(s):
+    for line in s.split("\n"):
+        if line.startswith("PATH="):
+            return line
+    return ""
+path_line = out.stdout.map(find_path)
+io.println(path_line)           # still masked
+```
 
 ### 2c. Network Access (`net`)
 
@@ -77,6 +90,20 @@ io.println(body)
 | Method | Returns | Notes |
 |--------|---------|-------|
 | `get(url)` | `string` | Host validated against allowlist. Redirect targets are re-checked. Passing a `Classified` value produces a type error at runtime. |
+| `get_classified(url)` | `Classified` | Same validation; the response body is wrapped in `Classified` (token endpoints, metadata services, ...). |
+| `post(url, body, content_type?)` | `string` | Plain POST. The body must be plain text; passing `Classified` data is rejected. |
+| `post_classified(url, body=Classified, content_type?)` | `Classified` | The only way to send classified data over the network: the body must be `Classified` and the response is wrapped in `Classified`. |
+
+---
+
+## 2d. LLM (`llm`)
+
+Available when the server has an LLM backend configured.
+
+| Method | Returns | Notes |
+|--------|---------|-------|
+| `chat(message)` | `string` | Plain chat. |
+| `chat_classified(message=Classified)` | `Classified` | Prompt and response stay inside the classified boundary. |
 
 ---
 
@@ -125,6 +152,7 @@ The real value goes to a secure output channel (if configured) — never to the 
 | Mistake | Error code |
 |---------|-----------|
 | Passing `Classified` to `write()` | `CLASSIFIED_WRITE_MISMATCH` — use `write_classified()` instead |
+| Passing `Classified` to `net.get`/`net.post`/`proc.exec` arguments (URLs, command lines, args) | `CLASSIFIED_ARG` — secrets must never appear in URLs or process arguments |
 | `io.println` inside a map callback | `IMPURE_METHOD_CALL` |
 | `fs.access` inside a map callback | `IMPURE_METHOD_CALL` |
 

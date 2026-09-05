@@ -24,6 +24,9 @@
 //	CITRON_CLASSIFIED_PATTERNS    Comma-separated classified glob patterns
 //	CITRON_SECURE_OUTPUT_PATH     Path for unmasked classified output
 //	CITRON_TIMEOUT_MS             Execution timeout in milliseconds (default 30000)
+//	CITRON_LLM_ENDPOINT           LLM chat-completions endpoint (enables the llm global)
+//	CITRON_LLM_MODEL              LLM model name
+//	CITRON_LLM_API_KEY            LLM bearer token
 package main
 
 import (
@@ -34,9 +37,12 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/mishudark/citron"
 	"github.com/mishudark/citron/analysis"
+	"github.com/mishudark/citron/caps"
 	"github.com/mishudark/citron/mcpclient"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -49,8 +55,33 @@ type ExecuteStarlarkParams struct {
 }
 
 type ExecuteStarlarkResult struct {
-	Output   string `json:"output" jsonschema:"The output from io.println calls"`
-	Duration int64  `json:"durationMs" jsonschema:"Execution time in milliseconds"`
+	Output   string      `json:"output" jsonschema:"The output from io.println calls"`
+	Duration int64       `json:"durationMs" jsonschema:"Execution time in milliseconds"`
+	Audit    []AuditInfo `json:"audit,omitempty" jsonschema:"Classified-data operations performed (paths, commands; never values)"`
+}
+
+type AuditResult struct {
+	Events []AuditInfo `json:"events" jsonschema:"Classified-data audit events from the last execution"`
+}
+
+// AuditInfo is the MCP-facing shape of a caps.AuditEvent. Detail carries
+// paths, URLs, or command names only, never classified values.
+type AuditInfo struct {
+	Time   string `json:"time"`
+	Op     string `json:"op"`
+	Detail string `json:"detail"`
+	Err    string `json:"error,omitempty"`
+}
+
+func toAuditInfo(events []caps.AuditEvent) []AuditInfo {
+	if len(events) == 0 {
+		return nil
+	}
+	out := make([]AuditInfo, len(events))
+	for i, e := range events {
+		out[i] = AuditInfo{Time: e.Time.Format(time.RFC3339), Op: e.Op, Detail: e.Detail, Err: e.Err}
+	}
+	return out
 }
 
 type AnalyzeStarlarkParams struct {
@@ -114,6 +145,14 @@ func main() {
 		TimeoutMs:          getEnvInt("CITRON_TIMEOUT_MS", 30000),
 	}
 
+	if endpoint := os.Getenv("CITRON_LLM_ENDPOINT"); endpoint != "" {
+		opts.LLM = &caps.LLMConfig{
+			Endpoint: endpoint,
+			Model:    os.Getenv("CITRON_LLM_MODEL"),
+			APIKey:   os.Getenv("CITRON_LLM_API_KEY"),
+		}
+	}
+
 	server := NewServer(opts)
 
 	// Determine transport: stdio or HTTP.
@@ -147,9 +186,12 @@ func NewServer(opts citron.Options, remoteCaps ...mcpclient.CapabilityInfo) *mcp
 		Version: "1.0.0",
 	}, &mcp.ServerOptions{
 		Instructions: "citron is a safety harness for AI agents. " +
-			"Write Starlark (Python) code using `fs`, `net`, `proc`, and `io` globals. " +
+			"Write Starlark (Python) code using `fs`, `net`, `proc`, `io`, and `llm` globals. " +
 			"Call `harness_guide` first to learn the API.",
 	})
+
+	var auditMu sync.Mutex
+	var lastAudit []caps.AuditEvent
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "execute_starlark",
@@ -167,7 +209,10 @@ func NewServer(opts citron.Options, remoteCaps ...mcpclient.CapabilityInfo) *mcp
 		if err != nil {
 			return nil, ExecuteStarlarkResult{}, fmt.Errorf("execution failed: %w", err)
 		}
-		return nil, ExecuteStarlarkResult{Output: res.Output, Duration: res.Duration}, nil
+		auditMu.Lock()
+		lastAudit = res.Audit
+		auditMu.Unlock()
+		return nil, ExecuteStarlarkResult{Output: res.Output, Duration: res.Duration, Audit: toAuditInfo(res.Audit)}, nil
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
@@ -194,6 +239,16 @@ func NewServer(opts citron.Options, remoteCaps ...mcpclient.CapabilityInfo) *mcp
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
+		Name:        "classified_audit",
+		Description: "Returns the classified-data audit events (reads, writes, unmasks, classified exec/net/llm operations) from the most recent execute_starlark call. Events contain paths, URLs, or command names only, never classified values.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, AuditResult, error) {
+		auditMu.Lock()
+		events := lastAudit
+		auditMu.Unlock()
+		return nil, AuditResult{Events: toAuditInfo(events)}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
 		Name:        "harness_guide",
 		Description: "Returns the citron HARNESS_GUIDE.md. Call this first to learn how to write Starlark code with the harness (capabilities, classified data, etc.).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, HarnessGuideResult, error) {
@@ -214,17 +269,24 @@ func NewServer(opts citron.Options, remoteCaps ...mcpclient.CapabilityInfo) *mcp
 			},
 			{
 				Name:        "Network",
-				Description: "HTTP GET requests to allowlisted hosts. Redirect targets are re-validated against the allowlist.",
+				Description: "HTTP GET/POST to allowlisted hosts. Redirect targets are re-validated against the allowlist. *_classified variants wrap the response (and require a Classified body for post) so sensitive payloads never enter plain context.",
 				Globals:     "net",
-				Methods:     "net.get(url) -> string",
-				Example:     "body = net.get(\"https://api.example.com/v1/status\")\nio.println(body)",
+				Methods:     "net.get(url) -> string\nnet.get_classified(url) -> Classified\nnet.post(url, body, content_type?) -> string\nnet.post_classified(url, body=Classified, content_type?) -> Classified",
+				Example:     `resp = net.get_classified("https://api.example.com/v1/tokens")` + "\n" + `n = resp.map(lambda s: len(s))` + "\n" + `io.println(n)`,
 			},
 			{
 				Name:        "Process",
-				Description: "Execute commands on the host system. Only allowlisted commands are permitted.",
+				Description: "Execute commands on the host system. Only allowlisted commands are permitted. exec_classified wraps stdout/stderr in Classified so command output that may contain secrets never enters plain context.",
 				Globals:     "proc",
-				Methods:     "proc.exec(cmd, args) -> string (stdout)",
-				Example:     `out = proc.exec("echo", ["hello world"])` + "\n" + `io.println(out)`,
+				Methods:     "proc.exec(cmd, args) -> string (stdout)\nproc.exec_classified(cmd, args) -> ClassifiedProcess (.stdout/.stderr -> Classified, .exit_code -> int)",
+				Example:     `out = proc.exec_classified("printenv", [])` + "\n" + `io.println(out.stdout)  # Classified(****)`,
+			},
+			{
+				Name:        "LLM",
+				Description: "Chat with a configured LLM backend. chat_classified keeps both prompt and response inside the classified boundary; llm must be configured server-side.",
+				Globals:     "llm",
+				Methods:     "llm.chat(message) -> string\nllm.chat_classified(message=Classified) -> Classified",
+				Example:     `reply = llm.chat_classified(secret)` + "\n" + `io.println(reply)  # Classified(****)`,
 			},
 			{
 				Name:        "IO",

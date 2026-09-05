@@ -57,12 +57,17 @@ func (io *IOCapability) writeSecure(a ...any) {
 	}
 	io.secure.mu.Lock()
 	defer io.secure.mu.Unlock()
+	unmasked := false
 	for _, v := range a {
 		if u, ok := v.(unmasker); ok {
+			unmasked = true
 			_, _ = fmt.Fprint(io.secure.w, u.unmask())
 		} else {
 			_, _ = fmt.Fprint(io.secure.w, v)
 		}
+	}
+	if unmasked {
+		RecordAudit("io.unmask", "secure sink", nil)
 	}
 }
 

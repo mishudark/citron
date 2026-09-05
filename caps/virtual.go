@@ -427,9 +427,12 @@ func (e *virtualEntryImpl) ReadClassified() (Classified[string], error) {
 		return Classified[string]{}, err
 	}
 	if !e.IsClassified() {
-		return Classified[string]{}, fmt.Errorf("cap: ReadClassified() only allowed on classified paths; %q is not classified", path)
+		err := fmt.Errorf("cap: ReadClassified() only allowed on classified paths; %q is not classified", path)
+		RecordAudit("read_classified", path, err)
+		return Classified[string]{}, err
 	}
 	v, ok := e.fs.vfs.Get(path)
+	RecordAudit("read_classified", path, nil)
 	if !ok {
 		return Classified[string]{}, fmt.Errorf("cap: file %q not found", path)
 	}
@@ -442,7 +445,11 @@ func (e *virtualEntryImpl) WriteClassified(data Classified[string]) error {
 		return err
 	}
 	if !e.IsClassified() {
-		return fmt.Errorf("cap: WriteClassified() only allowed on classified paths")
+		err := fmt.Errorf("cap: WriteClassified() only allowed on classified paths")
+		RecordAudit("write_classified", path, err)
+		return err
 	}
-	return e.fs.vfs.store(path, data.value)
+	err = e.fs.vfs.store(path, data.value)
+	RecordAudit("write_classified", path, err)
+	return err
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -25,12 +26,25 @@ type llmClient struct {
 
 var globalLLM *llmClient
 
+// llmMu guards globalLLM: SafeExecute and Session.Execute configure the
+// client per run, so concurrent executions race on the global otherwise.
+var llmMu sync.RWMutex
+
 func ConfigureLLM(cfg *LLMConfig) {
+	llmMu.Lock()
+	defer llmMu.Unlock()
 	if cfg != nil {
 		globalLLM = &llmClient{cfg: cfg}
 	} else {
 		globalLLM = nil
 	}
+}
+
+// currentLLM returns the configured client snapshot, or nil.
+func currentLLM() *llmClient {
+	llmMu.RLock()
+	defer llmMu.RUnlock()
+	return globalLLM
 }
 
 type chatMessage struct {
@@ -56,12 +70,13 @@ func Chat(message string) (string, error) {
 		attribute.Int("message_len", len(message)),
 	)
 
-	if globalLLM == nil {
+	client := currentLLM()
+	if client == nil {
 		EndSpan(span, fmt.Errorf("cap: LLM not configured"))
 		RecordOperation(context.Background(), "chat", fmt.Errorf("cap: LLM not configured"))
 		return "", fmt.Errorf("cap: LLM not configured")
 	}
-	result, err := globalLLM.chat(message)
+	result, err := client.chat(message)
 	EndSpan(span, err)
 	RecordOperation(context.Background(), "chat", err)
 	return result, err
@@ -70,13 +85,15 @@ func Chat(message string) (string, error) {
 func ChatClassified(message Classified[string]) (Classified[string], error) {
 	_, span := StartSpan(context.Background(), "caps.LLM.ChatClassified")
 
-	if globalLLM == nil {
+	client := currentLLM()
+	if client == nil {
 		EndSpan(span, fmt.Errorf("cap: LLM not configured"))
 		RecordOperation(context.Background(), "chat_classified", fmt.Errorf("cap: LLM not configured"))
 		return Classified[string]{}, fmt.Errorf("cap: LLM not configured")
 	}
 	// Only pure functions can access the classified content
-	result, err := globalLLM.chat(message.value)
+	result, err := client.chat(message.value)
+	RecordAudit("chat_classified", client.cfg.Model, err)
 	if err != nil {
 		EndSpan(span, err)
 		RecordOperation(context.Background(), "chat_classified", err)
