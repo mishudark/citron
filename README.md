@@ -85,8 +85,12 @@ upper = secret.map(to_upper)
 
 The static analyzer prevents:
 - Calling impure functions (`io.println`, `fs.access`, `proc.exec`, `net.get`) inside `map`/`flat_map` callbacks
-- Writing `Classified` data via `write()` (use `write_classified` instead)
+- Referencing the capability globals (`fs`, `io`, `net`, `proc`) inside callbacks, including through aliases or containers (`n = net`, `d = {"n": net}`)
+- Invoking `map`/`flat_map` indirectly (method-value aliases like `m = secret.map`, or `getattr` indirection) — callbacks are only verified on direct calls
+- Writing `Classified` data via `write()` (use `write_classified` instead), including taint propagated through concatenation (`"x" + secret`) and containers
 - Reassignment of external variables or mutable method calls inside callbacks
+
+Additionally, `SafeExecute` and `Session` reject injected globals (`Options.Extras`, e.g. remote MCP tool bindings) whose names shadow pure builtins like `str` or `list`, since such a shadow would silently defeat callback purity verification.
 
 ### Process Execution (`proc`)
 

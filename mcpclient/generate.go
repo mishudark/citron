@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/format"
+	"regexp"
+	"strconv"
 	"strings"
 	"text/template"
 )
@@ -42,6 +44,27 @@ func GenerateTools(tools []*ToolInfo, opts GenOptions) ([]byte, error) {
 	return GenerateAll(tools, nil, nil, opts)
 }
 
+var (
+	goIdentRE  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	buildTagRE = regexp.MustCompile(`^[A-Za-z0-9_,.+\-/()!&| \t]*$`)
+)
+
+// validateGenOptions rejects option values that could inject arbitrary Go
+// into the generated source: PackageName and FuncName land in `package` and
+// `func` positions, and Tag lands in a `//go:build` directive.
+func validateGenOptions(opts GenOptions) error {
+	if !goIdentRE.MatchString(opts.PackageName) {
+		return fmt.Errorf("mcpclient: GenOptions.PackageName %q is not a valid Go identifier", opts.PackageName)
+	}
+	if opts.FuncName != "" && !goIdentRE.MatchString(opts.FuncName) {
+		return fmt.Errorf("mcpclient: GenOptions.FuncName %q is not a valid Go identifier", opts.FuncName)
+	}
+	if !buildTagRE.MatchString(opts.Tag) {
+		return fmt.Errorf("mcpclient: GenOptions.Tag %q contains characters not allowed in a build tag", opts.Tag)
+	}
+	return nil
+}
+
 // GenerateAll produces formatted Go source code that creates Starlark builtins
 // for every MCP tool, resource, and prompt advertised by the remote server.
 // The generated code is a complete .go file ready to write to disk and
@@ -65,6 +88,9 @@ func GenerateTools(tools []*ToolInfo, opts GenOptions) ([]byte, error) {
 func GenerateAll(tools []*ToolInfo, resources []*ResourceInfo, prompts []*PromptInfo, opts GenOptions) ([]byte, error) {
 	if opts.PackageName == "" {
 		return nil, fmt.Errorf("mcpclient: GenOptions.PackageName is required")
+	}
+	if err := validateGenOptions(opts); err != nil {
+		return nil, err
 	}
 	if opts.FuncName == "" {
 		opts.FuncName = "RegisterMCPSession"
@@ -254,8 +280,9 @@ func escapeComment(s string) string {
 }
 
 // schemaToJSON serializes a JSON Schema map into a Go expression suitable
-// for embedding in generated code.  Returns "nil" for nil input, or returns
-// a backtick raw string literal containing the JSON.
+// for embedding in generated code.  Returns "nil" for nil input, or a
+// quoted string expression; a raw backtick literal would break compilation
+// whenever the server-controlled schema itself contains a backtick.
 func schemaToJSON(schema map[string]any) string {
 	if schema == nil {
 		return "nil"
@@ -264,7 +291,7 @@ func schemaToJSON(schema map[string]any) string {
 	if err != nil {
 		return "nil"
 	}
-	return "`" + string(data) + "`"
+	return strconv.Quote(string(data))
 }
 
 // buildMethodsString generates a Methods string for CapabilityInfo from a
@@ -367,6 +394,9 @@ type genServerTool struct {
 func GenerateServerTools(tools []*ToolInfo, opts GenOptions) ([]byte, error) {
 	if opts.PackageName == "" {
 		return nil, fmt.Errorf("mcpclient: GenOptions.PackageName is required")
+	}
+	if err := validateGenOptions(opts); err != nil {
+		return nil, err
 	}
 	if opts.FuncName == "" {
 		opts.FuncName = "RegisterRemoteTools"
@@ -487,6 +517,15 @@ import (
 	"go.starlark.net/starlark"
 )
 
+// citronContext returns the execution context carried by the Starlark thread
+// (including any timeout deadline), falling back to context.Background().
+func citronContext(thread *starlark.Thread) context.Context {
+	if ctx, ok := thread.Local("citron.ctx").(context.Context); ok && ctx != nil {
+		return ctx
+	}
+	return context.Background()
+}
+
 // {{.FuncName}} creates Starlark builtins for every MCP tool, resource, and
 // prompt advertised by the remote server. The returned starlark.StringDict can
 // be merged into a citron execution context so that Starlark code can call the
@@ -508,11 +547,14 @@ func {{.FuncName}}(session *mcp.ClientSession) starlark.StringDict {
 	{{- range .Tools }}
 		// {{.Doc}}
 		{{.Name | quote}}: starlark.NewBuiltin({{.Name | quote}}, func(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+			if len(args) > 0 {
+				return nil, fmt.Errorf("%s: expects keyword arguments, got %d positional", {{.Name | quote}}, len(args))
+			}
 			params := make(map[string]any, len(kwargs))
 			for _, kv := range kwargs {
 				params[string(kv[0].(starlark.String))] = mcpclient.FromStarlark(kv[1])
 			}
-			result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+			result, err := session.CallTool(citronContext(thread), &mcp.CallToolParams{
 				Name:      {{.Name | quote}},
 				Arguments: params,
 			})
@@ -527,7 +569,10 @@ func {{.FuncName}}(session *mcp.ClientSession) starlark.StringDict {
 	{{- range .Resources }}
 		// {{.Doc}}
 		{{.FuncName | quote}}: starlark.NewBuiltin({{.FuncName | quote}}, func(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-			result, err := session.ReadResource(context.Background(), &mcp.ReadResourceParams{
+			if len(args) > 0 {
+				return nil, fmt.Errorf("%s: expects no arguments, got %d positional", {{.FuncName | quote}}, len(args))
+			}
+			result, err := session.ReadResource(citronContext(thread), &mcp.ReadResourceParams{
 				URI: {{.URI | quote}},
 			})
 			if err != nil {
@@ -541,13 +586,22 @@ func {{.FuncName}}(session *mcp.ClientSession) starlark.StringDict {
 	{{- range .Prompts }}
 		// {{.Doc}}
 		{{.Name | quote}}: starlark.NewBuiltin({{.Name | quote}}, func(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+			if len(args) > 0 {
+				return nil, fmt.Errorf("%s: expects keyword arguments, got %d positional", {{.Name | quote}}, len(args))
+			}
 			argMap := make(map[string]string, len(kwargs))
 			for _, kv := range kwargs {
-				key := string(kv[0].(starlark.String))
-				val, _ := starlark.AsString(kv[1])
-				argMap[key] = val
+				key, ok := kv[0].(starlark.String)
+				if !ok {
+					return nil, fmt.Errorf("%s: argument names must be strings", {{.Name | quote}})
+				}
+				val, ok := starlark.AsString(kv[1])
+				if !ok {
+					return nil, fmt.Errorf("%s: argument %q must be a string, got %s", {{.Name | quote}}, string(key), kv[1].Type())
+				}
+				argMap[string(key)] = val
 			}
-			result, err := session.GetPrompt(context.Background(), &mcp.GetPromptParams{
+			result, err := session.GetPrompt(citronContext(thread), &mcp.GetPromptParams{
 				Name:      {{.Name | quote}},
 				Arguments: argMap,
 			})

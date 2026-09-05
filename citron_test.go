@@ -150,8 +150,8 @@ func TestSafeExecuteExtrasCannotOverrideBuiltins(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SafeExecute with Extras attempting to override io: %v", err)
 	}
-	if result.Output != "\"hello\"\n" {
-		t.Fatalf("expected output '\"hello\"\\n', got %q; io should be the real capability", result.Output)
+	if result.Output != "hello\n" {
+		t.Fatalf("expected output 'hello\\n', got %q; io should be the real capability", result.Output)
 	}
 }
 

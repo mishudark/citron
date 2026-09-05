@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -39,7 +40,7 @@ type FileEntry interface {
 type fsImpl struct {
 	capabilityMarker
 	root  string
-	valid bool
+	valid atomic.Bool
 	cfg   *FileSystemConfig
 }
 
@@ -51,6 +52,11 @@ var DefaultClassifiedPatterns = []string{
 	".ssh/**", ".gnupg/**", ".env", ".env.*", ".netrc",
 	".npmrc", ".pypirc", ".docker/**", ".kube/**",
 	".aws/**", ".azure/**", ".gcloud/**",
+	// Nested variants: previously only root-level credentials were
+	// classified; "sub/.env" and friends were readable as plain text.
+	"**/.ssh/**", "**/.gnupg/**", "**/.env", "**/.env.*", "**/.netrc",
+	"**/.npmrc", "**/.pypirc", "**/.docker/**", "**/.kube/**",
+	"**/.aws/**", "**/.azure/**", "**/.gcloud/**",
 }
 
 type fileEntryImpl struct {
@@ -81,18 +87,18 @@ func RequestFileSystem[T any](
 		return zero, fmt.Errorf("cap: bad filesystem root %q: %w", root, err)
 	}
 	fs := &fsImpl{
-		root:  absRoot,
-		valid: true,
-		cfg:   cfg,
+		root: absRoot,
+		cfg:  cfg,
 	}
-	defer func() { fs.valid = false }()
+	fs.valid.Store(true)
+	defer func() { fs.valid.Store(false) }()
 	result, err := op(fs)
 	EndSpan(span, err)
 	return result, err
 }
 
 func (fs *fsImpl) Access(path string) (FileEntry, error) {
-	if !fs.valid {
+	if !fs.valid.Load() {
 		return nil, errCapabilityUsedAfterScope("FileSystem")
 	}
 	full, err := fs.resolve(path)
@@ -361,17 +367,46 @@ func (e *fileEntryImpl) IsClassified() bool {
 }
 
 func matchPath(pattern, path string) bool {
-	// Simple implementation of ** support
-	if strings.Contains(pattern, "**") {
-		prefix := strings.Split(pattern, "**")[0]
-		return strings.HasPrefix(path, prefix)
-	}
-	match, _ := filepath.Match(pattern, path)
-	if match {
+	// Segment-wise glob matching with real "**" support: "**" matches any
+	// number of path segments, including mid-path occurrences like
+	// "a/**/b", which the previous prefix hack degenerated to "a/".
+	patSegs := strings.Split(filepath.ToSlash(pattern), "/")
+	pathSegs := strings.Split(filepath.ToSlash(path), "/")
+	if matchSegments(patSegs, pathSegs) {
 		return true
 	}
-	// Also check if path is inside a directory matched by pattern
-	return strings.HasPrefix(path, strings.TrimRight(pattern, "/")+"/")
+	// A wildcard-free pattern also matches everything inside it when used
+	// as a directory prefix (e.g. pattern "secrets" covers "secrets/x").
+	if !strings.ContainsAny(pattern, "*?[") {
+		prefix := strings.TrimRight(filepath.ToSlash(pattern), "/") + "/"
+		return strings.HasPrefix(filepath.ToSlash(path), prefix)
+	}
+	return false
+}
+
+func matchSegments(pat, path []string) bool {
+	for len(pat) > 0 {
+		if pat[0] == "**" {
+			rest := pat[1:]
+			if len(rest) == 0 {
+				return true
+			}
+			for i := 0; i <= len(path); i++ {
+				if matchSegments(rest, path[i:]) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(path) == 0 {
+			return false
+		}
+		if ok, _ := filepath.Match(pat[0], path[0]); !ok {
+			return false
+		}
+		pat, path = pat[1:], path[1:]
+	}
+	return len(path) == 0
 }
 
 func (e *fileEntryImpl) ReadClassified() (Classified[string], error) {
@@ -395,11 +430,11 @@ func (e *fileEntryImpl) WriteClassified(data Classified[string]) error {
 	if !e.IsClassified() {
 		return fmt.Errorf("cap: WriteClassified() only allowed on classified paths")
 	}
-	return os.WriteFile(e.path, []byte(data.value), 0o644)
+	return os.WriteFile(e.path, []byte(data.value), 0o600)
 }
 
 func (e *fileEntryImpl) checkValid() error {
-	if e.fs == nil || !e.fs.valid {
+	if e.fs == nil || !e.fs.valid.Load() {
 		return errCapabilityUsedAfterScope("FileEntry")
 	}
 	return nil
