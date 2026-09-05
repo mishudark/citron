@@ -105,9 +105,12 @@ The callback MUST be a **pure function** — no side effects.
 The static analyzer prevents:
 1. Re-assigning external variables (`a[0] = 1`, `a.b = 2`).
 2. Calling mutative methods on lists/dicts (`.append()`, `.pop()`).
-3. Calling global impure functions (`io.println`, `fs.access`).
+3. Calling global impure functions (`io.println`, `fs.access`, `net.get`, `proc.exec`).
+4. Referencing the capability globals `fs`, `io`, `net`, `proc` — directly, via an alias (`n = net`), or via any value that holds them (e.g. `d = {"n": net}`).
 
-**Allowed inside callbacks:** string methods (`upper()`, `replace()`, `split()`, etc.), pure builtins (`len`, `max`, `str`), control flow (`if`, `for`), and chained `map`/`flat_map` calls on other classified values. Nested functions (defined inside other functions) are also valid callbacks.
+`map`/`flat_map` must also be invoked **directly** — `secret.map(cb)`, not through a saved method value (`m = secret.map; m(cb)`) or `getattr(secret, "map")(cb)`.
+
+**Allowed inside callbacks:** string methods (`upper()`, `replace()`, `split()`, etc.), pure builtins (`len`, `max`, `str`), control flow (`if`, `for`), and chained `map`/`flat_map` calls on other classified values (these methods are treated as pure). Nested functions (defined inside other functions) are also valid callbacks.
 
 ### Output is masked
 

@@ -235,7 +235,10 @@ func buildConnConfig(cfg *config) (*mcpclient.Config, error) {
 		}, nil
 
 	case cfg.command != "":
-		parts := strings.Fields(cfg.command)
+		parts, err := splitCommand(cfg.command)
+		if err != nil {
+			return nil, err
+		}
 		if len(parts) == 0 {
 			return nil, errors.New("empty --command")
 		}
@@ -248,4 +251,43 @@ func buildConnConfig(cfg *config) (*mcpclient.Config, error) {
 	default:
 		return nil, errors.New("no transport specified")
 	}
+}
+
+// splitCommand splits a --command string into argv, honoring single quotes,
+// double quotes, and backslash escapes, so commands with quoted arguments
+// (e.g. --command 'server --flag "a b"') are not mangled.
+func splitCommand(s string) ([]string, error) {
+	var parts []string
+	var cur strings.Builder
+	var inSingle, inDouble, escaped, hadToken bool
+	for _, r := range s {
+		switch {
+		case escaped:
+			cur.WriteRune(r)
+			escaped = false
+		case r == '\\' && !inSingle:
+			escaped = true
+		case r == '\'' && !inDouble:
+			inSingle = !inSingle
+			hadToken = true
+		case r == '"' && !inSingle:
+			inDouble = !inDouble
+			hadToken = true
+		case (r == ' ' || r == '\t') && !inSingle && !inDouble:
+			if cur.Len() > 0 || hadToken {
+				parts = append(parts, cur.String())
+				cur.Reset()
+				hadToken = false
+			}
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if inSingle || inDouble {
+		return nil, errors.New("unterminated quote in --command")
+	}
+	if cur.Len() > 0 || hadToken {
+		parts = append(parts, cur.String())
+	}
+	return parts, nil
 }

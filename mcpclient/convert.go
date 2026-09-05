@@ -25,42 +25,76 @@ import (
 //	starlark.Callable  → string (.String())
 //	other              → string (fallback, .String())
 func FromStarlark(v starlark.Value) any {
+	out, err := starlarkToAny(v, 0)
+	if err != nil {
+		// Cyclic or over-deep value; keep the public single-return contract
+		// by degrading to a descriptive placeholder.
+		return err.Error()
+	}
+	return out
+}
+
+// maxConversionDepth bounds recursion when converting self-referential
+// values (e.g. a Starlark list containing itself), which would otherwise
+// recurse until the stack overflows and crashes the host process.
+const maxConversionDepth = 32
+
+func starlarkToAny(v starlark.Value, depth int) (any, error) {
+	if depth > maxConversionDepth {
+		return nil, fmt.Errorf("mcpclient: value exceeds maximum conversion depth (%d); likely self-referential", maxConversionDepth)
+	}
+	return starlarkToAnyInner(v, depth)
+}
+
+func starlarkToAnyInner(v starlark.Value, depth int) (any, error) {
 	switch val := v.(type) {
 	case starlark.String:
-		return string(val)
+		return string(val), nil
 	case starlark.Int:
 		n, ok := val.Int64()
 		if ok {
-			return n
+			return n, nil
 		}
-		return val.String()
+		return val.String(), nil
 	case starlark.Float:
-		return float64(val)
+		return float64(val), nil
 	case starlark.Bool:
-		return bool(val)
+		return bool(val), nil
 	case starlark.NoneType:
-		return nil
+		return nil, nil
 	case *starlark.List:
 		elems := make([]any, val.Len())
 		for i := 0; i < val.Len(); i++ {
-			elems[i] = FromStarlark(val.Index(i))
+			e, err := starlarkToAny(val.Index(i), depth+1)
+			if err != nil {
+				return nil, err
+			}
+			elems[i] = e
 		}
-		return elems
+		return elems, nil
 	case starlark.Tuple:
 		elems := make([]any, val.Len())
 		for i := 0; i < val.Len(); i++ {
-			elems[i] = FromStarlark(val.Index(i))
+			e, err := starlarkToAny(val.Index(i), depth+1)
+			if err != nil {
+				return nil, err
+			}
+			elems[i] = e
 		}
-		return elems
+		return elems, nil
 	case *starlark.Set:
 		elems := make([]any, 0, val.Len())
 		it := val.Iterate()
 		defer it.Done()
 		var elem starlark.Value
 		for it.Next(&elem) {
-			elems = append(elems, FromStarlark(elem))
+			e, err := starlarkToAny(elem, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			elems = append(elems, e)
 		}
-		return elems
+		return elems, nil
 	case *starlark.Dict:
 		out := make(map[string]any, val.Len())
 		for _, item := range val.Items() {
@@ -68,11 +102,15 @@ func FromStarlark(v starlark.Value) any {
 			if !ok {
 				continue
 			}
-			out[key] = FromStarlark(item[1])
+			e, err := starlarkToAny(item[1], depth+1)
+			if err != nil {
+				return nil, err
+			}
+			out[key] = e
 		}
-		return out
+		return out, nil
 	default:
-		return v.String()
+		return v.String(), nil
 	}
 }
 
@@ -136,6 +174,13 @@ func MCPResultToStarlark(result *mcp.CallToolResult) (starlark.Value, error) {
 //	map[string]any   → *starlark.Dict  (keys are strings, values recursed)
 //	other            → starlark.String(fmt.Sprint(v))
 func GoToStarlark(v any) (starlark.Value, error) {
+	return goToStarlark(v, 0)
+}
+
+func goToStarlark(v any, depth int) (starlark.Value, error) {
+	if depth > maxConversionDepth {
+		return nil, fmt.Errorf("mcpclient: value exceeds maximum conversion depth (%d); likely self-referential", maxConversionDepth)
+	}
 	switch val := v.(type) {
 	case nil:
 		return starlark.None, nil
@@ -154,7 +199,7 @@ func GoToStarlark(v any) (starlark.Value, error) {
 	case []any:
 		elems := make([]starlark.Value, len(val))
 		for i, e := range val {
-			s, err := GoToStarlark(e)
+			s, err := goToStarlark(e, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -164,7 +209,7 @@ func GoToStarlark(v any) (starlark.Value, error) {
 	case map[string]any:
 		d := starlark.NewDict(len(val))
 		for k, vv := range val {
-			sv, err := GoToStarlark(vv)
+			sv, err := goToStarlark(vv, depth+1)
 			if err != nil {
 				return nil, err
 			}

@@ -32,12 +32,32 @@ package mcpclient
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os/exec"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// maxListPages bounds pagination: a malicious or buggy server that never
+// stops returning a NextCursor must not loop forever.
+const maxListPages = 1000
+
+// paginate advances a paged listing with loop protection.
+func paginate(cursor string, seen map[string]bool) (string, error) {
+	if cursor == "" {
+		return "", nil
+	}
+	if seen[cursor] {
+		return "", fmt.Errorf("mcpclient: server returned a repeated pagination cursor %q", cursor)
+	}
+	seen[cursor] = true
+	if len(seen) > maxListPages {
+		return "", fmt.Errorf("mcpclient: pagination did not terminate after %d pages", maxListPages)
+	}
+	return cursor, nil
+}
 
 // TransportType selects the wire protocol for connecting to a remote MCP server.
 type TransportType int
@@ -172,14 +192,36 @@ func Connect(ctx context.Context, cfg *Config) (*mcp.ClientSession, error) {
 	if timeout == 0 {
 		timeout = 30 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
-	session, err := client.Connect(ctx, transport, nil)
-	if err != nil {
-		return nil, fmt.Errorf("mcpclient: connect (%s): %w", transportNames[cfg.Transport], err)
+	// The timeout applies to the handshake only. The session must not be
+	// bound to a context we cancel when Connect returns: cancelling would
+	// tear down the connection immediately. The session context therefore
+	// outlives this call; its lifetime ends with session.Close().
+	sessionCtx := context.WithoutCancel(ctx)
+	type connectResult struct {
+		session *mcp.ClientSession
+		err     error
 	}
-	return session, nil
+	ch := make(chan connectResult, 1)
+	go func() {
+		s, e := client.Connect(sessionCtx, transport, nil)
+		ch <- connectResult{s, e}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return nil, fmt.Errorf("mcpclient: connect (%s): %w", transportNames[cfg.Transport], r.err)
+		}
+		return r.session, nil
+	case <-timer.C:
+		if closer, ok := transport.(io.Closer); ok {
+			_ = closer.Close()
+		}
+		return nil, fmt.Errorf("mcpclient: connect (%s): timed out after %v", transportNames[cfg.Transport], timeout)
+	}
 }
 
 // ListTools retrieves all tool definitions from a connected MCP session.
@@ -187,6 +229,7 @@ func Connect(ctx context.Context, cfg *Config) (*mcp.ClientSession, error) {
 func ListTools(ctx context.Context, session *mcp.ClientSession) ([]*ToolInfo, error) {
 	var all []*ToolInfo
 	var cursor string
+	seen := make(map[string]bool)
 
 	for {
 		result, err := session.ListTools(ctx, &mcp.ListToolsParams{Cursor: cursor})
@@ -207,7 +250,11 @@ func ListTools(ctx context.Context, session *mcp.ClientSession) ([]*ToolInfo, er
 		if result.NextCursor == "" {
 			break
 		}
-		cursor = result.NextCursor
+		next, err := paginate(result.NextCursor, seen)
+		if err != nil {
+			return nil, err
+		}
+		cursor = next
 	}
 
 	if all == nil {
@@ -221,6 +268,7 @@ func ListTools(ctx context.Context, session *mcp.ClientSession) ([]*ToolInfo, er
 func ListResources(ctx context.Context, session *mcp.ClientSession) ([]*ResourceInfo, error) {
 	var all []*ResourceInfo
 	var cursor string
+	seen := make(map[string]bool)
 	for {
 		result, err := session.ListResources(ctx, &mcp.ListResourcesParams{Cursor: cursor})
 		if err != nil {
@@ -237,7 +285,11 @@ func ListResources(ctx context.Context, session *mcp.ClientSession) ([]*Resource
 		if result.NextCursor == "" {
 			break
 		}
-		cursor = result.NextCursor
+		next, err := paginate(result.NextCursor, seen)
+		if err != nil {
+			return nil, err
+		}
+		cursor = next
 	}
 	if all == nil {
 		return []*ResourceInfo{}, nil
@@ -250,6 +302,7 @@ func ListResources(ctx context.Context, session *mcp.ClientSession) ([]*Resource
 func ListPrompts(ctx context.Context, session *mcp.ClientSession) ([]*PromptInfo, error) {
 	var all []*PromptInfo
 	var cursor string
+	seen := make(map[string]bool)
 	for {
 		result, err := session.ListPrompts(ctx, &mcp.ListPromptsParams{Cursor: cursor})
 		if err != nil {
@@ -272,7 +325,11 @@ func ListPrompts(ctx context.Context, session *mcp.ClientSession) ([]*PromptInfo
 		if result.NextCursor == "" {
 			break
 		}
-		cursor = result.NextCursor
+		next, err := paginate(result.NextCursor, seen)
+		if err != nil {
+			return nil, err
+		}
+		cursor = next
 	}
 	if all == nil {
 		return []*PromptInfo{}, nil

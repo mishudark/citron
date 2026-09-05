@@ -66,6 +66,7 @@ type AnalyzeIssue struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
 	Line    int    `json:"line"`
+	Col     int    `json:"col"`
 }
 
 type CapabilitiesResult struct {
@@ -171,7 +172,7 @@ func NewServer(opts citron.Options, remoteCaps ...mcpclient.CapabilityInfo) *mcp
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "analyze_starlark",
-		Description: "Run the static analyzer on a Starlark code snippet without executing it. Returns structured results listing each safety issue found (impure callbacks, Classified write mismatches, etc.).",
+		Description: "Run the static analyzer on a Starlark code snippet without executing it. Returns structured results listing each safety issue found (impure callbacks, capability references inside callbacks, map/flat_map indirection, Classified write mismatches, etc.).",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, params AnalyzeStarlarkParams) (*mcp.CallToolResult, AnalyzeStarlarkResult, error) {
 		issues, err := analysis.Analyze("agent.star", []byte(params.Code))
 		if err != nil {
@@ -186,6 +187,7 @@ func NewServer(opts citron.Options, remoteCaps ...mcpclient.CapabilityInfo) *mcp
 				Code:    iss.Code,
 				Message: iss.Message,
 				Line:    int(iss.Pos.Line),
+				Col:     int(iss.Pos.Col),
 			})
 		}
 		return nil, result, nil
@@ -233,7 +235,7 @@ func NewServer(opts citron.Options, remoteCaps ...mcpclient.CapabilityInfo) *mcp
 			},
 			{
 				Name:        "Classified",
-				Description: "Wraps sensitive values to prevent exfiltration. Supports pure transformations via map/flat_map. The static analyzer rejects impure callbacks (io.println, fs.access, etc. inside map).",
+				Description: "Wraps sensitive values to prevent exfiltration. Supports pure transformations via map/flat_map. The static analyzer rejects impure callbacks and any reference to the fs/io/net/proc capabilities (or aliases holding them) inside callbacks; map/flat_map must be invoked directly.",
 				Globals:     "Classified (returned by read_classified())",
 				Methods:     "classified.map(callback) -> Classified\nclassified.flat_map(callback) -> Classified",
 				Example:     `secret = fs.access("key.txt").read_classified()` + "\n" + `def to_upper(s): return s.upper()` + "\n" + `upper = secret.map(to_upper)` + "\n" + `io.println(upper)  # Classified(****)`,

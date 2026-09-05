@@ -1,6 +1,7 @@
 package citron
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/mishudark/citron/caps"
@@ -38,12 +39,13 @@ func (s *starlarkFileSystem) Attr(name string) (starlark.Value, error) {
 func (s *starlarkFileSystem) AttrNames() []string { return []string{"access"} }
 
 type starlarkFileEntry struct {
-	f caps.FileEntry
+	f      caps.FileEntry
+	frozen bool
 }
 
 func (s *starlarkFileEntry) String() string        { return fmt.Sprintf("<FileEntry %s>", s.f.Name()) }
 func (s *starlarkFileEntry) Type() string          { return "FileEntry" }
-func (s *starlarkFileEntry) Freeze()               {}
+func (s *starlarkFileEntry) Freeze()               { s.frozen = true }
 func (s *starlarkFileEntry) Truth() starlark.Bool  { return true }
 func (s *starlarkFileEntry) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable: FileEntry") }
 
@@ -59,6 +61,9 @@ func (s *starlarkFileEntry) Attr(name string) (starlark.Value, error) {
 		}), nil
 	case "write":
 		return starlark.NewBuiltin("write", func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+			if s.frozen {
+				return nil, fmt.Errorf("write: FileEntry is frozen")
+			}
 			var data string
 			if err := starlark.UnpackArgs("write", args, kwargs, "content", &data); err != nil {
 				return nil, err
@@ -78,6 +83,9 @@ func (s *starlarkFileEntry) Attr(name string) (starlark.Value, error) {
 		}), nil
 	case "write_classified":
 		return starlark.NewBuiltin("write_classified", func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+			if s.frozen {
+				return nil, fmt.Errorf("write_classified: FileEntry is frozen")
+			}
 			var cv starlark.Value
 			if err := starlark.UnpackArgs("write_classified", args, kwargs, "data", &cv); err != nil {
 				return nil, err
@@ -120,9 +128,8 @@ func (s *starlarkClassified) Attr(name string) (starlark.Value, error) {
 			}
 
 			var result caps.Classified[string]
-			ok := safeClassifiedMap(s.c, fn, thread, &result)
-			if !ok {
-				return nil, fmt.Errorf("map callback failed")
+			if err := safeClassifiedMap(s.c, fn, thread, &result); err != nil {
+				return nil, err
 			}
 			return &starlarkClassified{c: result}, nil
 		}), nil
@@ -135,9 +142,8 @@ func (s *starlarkClassified) Attr(name string) (starlark.Value, error) {
 			}
 
 			var result caps.Classified[string]
-			ok := safeClassifiedFlatMap(s.c, fn, thread, &result)
-			if !ok {
-				return nil, fmt.Errorf("flat_map callback failed")
+			if err := safeClassifiedFlatMap(s.c, fn, thread, &result); err != nil {
+				return nil, err
 			}
 			return &starlarkClassified{c: result}, nil
 		}), nil
@@ -146,38 +152,74 @@ func (s *starlarkClassified) Attr(name string) (starlark.Value, error) {
 }
 func (s *starlarkClassified) AttrNames() []string { return []string{"map", "flat_map"} }
 
+// callbackError is a private sentinel used to carry a callback failure out
+// of the caps.Map/FlatMap closures without letting an arbitrary panic escape.
+type callbackError struct{ err error }
+
+// sanitizeCallbackError strips the error message of a Starlark evaluation
+// failure (which may echo classified data) but keeps its source position so
+// failures remain debuggable.
+func sanitizeCallbackError(err error) error {
+	var evalErr *starlark.EvalError
+	if errors.As(err, &evalErr) {
+		stack := evalErr.CallStack
+		if len(stack) > 0 {
+			return fmt.Errorf("%s: callback error (message suppressed to avoid leaking classified data)", stack[len(stack)-1].Pos)
+		}
+		return errors.New("callback error (message suppressed to avoid leaking classified data)")
+	}
+	return err
+}
+
 // safeClassifiedMap calls caps.Map with a panic-recovering wrapper so that
-// any error from the starlark callback is returned as a sanitized error
-// rather than leaking classified data through panic messages.
-func safeClassifiedMap(c caps.Classified[string], fn starlark.Callable, thread *starlark.Thread, result *caps.Classified[string]) (ok bool) {
-	defer func() { _ = recover() }()
+// callback failures are returned as sanitized errors rather than leaking
+// classified data through panic messages or error strings.
+func safeClassifiedMap(c caps.Classified[string], fn starlark.Callable, thread *starlark.Thread, result *caps.Classified[string]) (cbErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if ce, ok := r.(callbackError); ok {
+				cbErr = ce.err
+				return
+			}
+			panic(r)
+		}
+	}()
 	*result = caps.Map(c, func(val string) string {
 		v, err := starlark.Call(thread, fn, starlark.Tuple{starlark.String(val)}, nil)
 		if err != nil {
-			panic("map callback failed")
+			panic(callbackError{sanitizeCallbackError(err)})
 		}
-		if str, ok := starlark.AsString(v); ok {
-			return str
+		str, ok := starlark.AsString(v)
+		if !ok {
+			panic(callbackError{fmt.Errorf("map callback must return a string, got %s", v.Type())})
 		}
-		return v.String()
+		return str
 	})
-	return true
+	return nil
 }
 
 // safeClassifiedFlatMap is the flat_map equivalent with panic-safe error handling.
-func safeClassifiedFlatMap(c caps.Classified[string], fn starlark.Callable, thread *starlark.Thread, result *caps.Classified[string]) (ok bool) {
-	defer func() { _ = recover() }()
+func safeClassifiedFlatMap(c caps.Classified[string], fn starlark.Callable, thread *starlark.Thread, result *caps.Classified[string]) (cbErr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if ce, ok := r.(callbackError); ok {
+				cbErr = ce.err
+				return
+			}
+			panic(r)
+		}
+	}()
 	*result = caps.FlatMap(c, func(val string) caps.Classified[string] {
 		v, err := starlark.Call(thread, fn, starlark.Tuple{starlark.String(val)}, nil)
 		if err != nil {
-			panic("flat_map callback failed")
+			panic(callbackError{sanitizeCallbackError(err)})
 		}
 		if sc, ok := v.(*starlarkClassified); ok {
 			return sc.c
 		}
-		panic("flat_map callback must return Classified")
+		panic(callbackError{fmt.Errorf("flat_map callback must return Classified, got %s", v.Type())})
 	})
-	return true
+	return nil
 }
 
 // --- IOCapability Bindings ---
@@ -195,11 +237,17 @@ func (s *starlarkIO) Hash() (uint32, error) { return 0, fmt.Errorf("unhashable: 
 func (s *starlarkIO) Attr(name string) (starlark.Value, error) {
 	if name == "println" {
 		return starlark.NewBuiltin("println", func(thread *starlark.Thread, b *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+			if len(kwargs) > 0 {
+				return nil, fmt.Errorf("println: unexpected keyword arguments")
+			}
 			var vals []any
 			for _, arg := range args {
-				if sc, ok := arg.(*starlarkClassified); ok {
-					vals = append(vals, sc.c) // pass caps.Classified to IO so it can unmask
-				} else {
+				switch v := arg.(type) {
+				case *starlarkClassified:
+					vals = append(vals, v.c) // pass caps.Classified to IO so it can unmask
+				case starlark.String:
+					vals = append(vals, string(v)) // print text, not the quoted repr
+				default:
 					vals = append(vals, arg.String())
 				}
 			}
@@ -265,9 +313,11 @@ func (s *starlarkProc) Attr(name string) (starlark.Value, error) {
 			var strArgs []string
 			if cmdArgs != nil {
 				for i := 0; i < cmdArgs.Len(); i++ {
-					if str, ok := starlark.AsString(cmdArgs.Index(i)); ok {
-						strArgs = append(strArgs, str)
+					str, ok := starlark.AsString(cmdArgs.Index(i))
+					if !ok {
+						return nil, fmt.Errorf("exec: args[%d] must be a string, got %s", i, cmdArgs.Index(i).Type())
 					}
+					strArgs = append(strArgs, str)
 				}
 			}
 

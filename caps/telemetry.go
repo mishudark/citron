@@ -2,6 +2,7 @@ package caps
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel"
@@ -13,44 +14,68 @@ import (
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 )
 
+// The provider globals are read on every span/metric call and written by the
+// Set* functions, potentially from concurrent SafeExecute calls, so all
+// access is guarded by telMu.
 var (
-	globalTracerProvider trace.TracerProvider = otel.GetTracerProvider()
-	globalMeterProvider  metric.MeterProvider = otel.GetMeterProvider()
+	telMu          sync.RWMutex
+	tracerProvider trace.TracerProvider = otel.GetTracerProvider()
+	meterProvider  metric.MeterProvider = otel.GetMeterProvider()
+)
+
+// Instruments are created once per meter and reused; creating them on every
+// call defeats aggregation and adds allocation to every operation.
+var (
+	instMu       sync.Mutex
+	instMeter    metric.Meter
+	instRequests metric.Int64Counter
+	instOps      metric.Int64Counter
+	instDuration metric.Int64Histogram
 )
 
 // SetTracerProvider sets the global tracer provider for capability tracing.
 // If tp is nil, the global OTel tracer provider is used.
 func SetTracerProvider(tp trace.TracerProvider) {
+	telMu.Lock()
+	defer telMu.Unlock()
 	if tp == nil {
-		globalTracerProvider = otel.GetTracerProvider()
+		tracerProvider = otel.GetTracerProvider()
 		return
 	}
-	globalTracerProvider = tp
+	tracerProvider = tp
 }
 
 // SetMeterProvider sets the global meter provider for capability metrics.
 // If mp is nil, the global OTel meter provider is used.
 func SetMeterProvider(mp metric.MeterProvider) {
+	telMu.Lock()
+	defer telMu.Unlock()
 	if mp == nil {
-		globalMeterProvider = otel.GetMeterProvider()
+		meterProvider = otel.GetMeterProvider()
 		return
 	}
-	globalMeterProvider = mp
+	meterProvider = mp
 }
 
 // SetNoopTelemetry disables all tracing and metrics by setting
 // noop providers for both traces and metrics.
 func SetNoopTelemetry() {
-	globalTracerProvider = tracenoop.NewTracerProvider()
-	globalMeterProvider = noop.NewMeterProvider()
+	telMu.Lock()
+	defer telMu.Unlock()
+	tracerProvider = tracenoop.NewTracerProvider()
+	meterProvider = noop.NewMeterProvider()
 }
 
 func tracer() trace.Tracer {
-	return globalTracerProvider.Tracer("github.com/mishudark/citron/caps")
+	telMu.RLock()
+	defer telMu.RUnlock()
+	return tracerProvider.Tracer("github.com/mishudark/citron/caps")
 }
 
 func meter() metric.Meter {
-	return globalMeterProvider.Meter("github.com/mishudark/citron/caps")
+	telMu.RLock()
+	defer telMu.RUnlock()
+	return meterProvider.Meter("github.com/mishudark/citron/caps")
 }
 
 func StartSpan(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span) {
@@ -67,16 +92,47 @@ func EndSpan(span trace.Span, err error) {
 	span.End()
 }
 
+// cachedInstruments returns the request/operation counters bound to the
+// current meter, creating them on first use or when the meter changes.
+func cachedInstruments() (metric.Int64Counter, metric.Int64Counter, metric.Int64Histogram, bool) {
+	m := meter()
+	instMu.Lock()
+	defer instMu.Unlock()
+	if instRequests == nil || instMeter != m {
+		reqs, err := m.Int64Counter("caps.requests",
+			metric.WithDescription("Total number of capability requests"),
+			metric.WithUnit("1"),
+		)
+		if err != nil {
+			return nil, nil, nil, false
+		}
+		ops, err := m.Int64Counter("caps.operations",
+			metric.WithDescription("Total number of capability operations"),
+			metric.WithUnit("1"),
+		)
+		if err != nil {
+			return nil, nil, nil, false
+		}
+		dur, err := m.Int64Histogram("caps.operation_duration_ms",
+			metric.WithDescription("Duration of capability operations"),
+			metric.WithUnit("ms"),
+		)
+		if err != nil {
+			return nil, nil, nil, false
+		}
+		instRequests, instOps, instDuration = reqs, ops, dur
+		instMeter = m
+	}
+	return instRequests, instOps, instDuration, true
+}
+
 // RecordRequest records a capability request counter.
 func RecordRequest(ctx context.Context, capType string) {
-	c, err := meter().Int64Counter("caps.requests",
-		metric.WithDescription("Total number of capability requests"),
-		metric.WithUnit("1"),
-	)
-	if err != nil {
+	reqs, _, _, ok := cachedInstruments()
+	if !ok {
 		return
 	}
-	c.Add(ctx, 1, metric.WithAttributes(
+	reqs.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("type", capType),
 	))
 }
@@ -87,15 +143,11 @@ func RecordOperation(ctx context.Context, operation string, err error) {
 	if err != nil {
 		status = "error"
 	}
-
-	c, err := meter().Int64Counter("caps.operations",
-		metric.WithDescription("Total number of capability operations"),
-		metric.WithUnit("1"),
-	)
-	if err != nil {
+	_, ops, _, ok := cachedInstruments()
+	if !ok {
 		return
 	}
-	c.Add(ctx, 1, metric.WithAttributes(
+	ops.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("operation", operation),
 		attribute.String("status", status),
 	))
@@ -119,14 +171,11 @@ func RecordOperationWithKind(ctx context.Context, operation, kind string, err er
 		attrs = append(attrs, attribute.String("error_kind", kind))
 	}
 
-	c, cerr := meter().Int64Counter("caps.operations",
-		metric.WithDescription("Total number of capability operations"),
-		metric.WithUnit("1"),
-	)
-	if cerr != nil {
+	_, ops, _, ok := cachedInstruments()
+	if !ok {
 		return
 	}
-	c.Add(ctx, 1, metric.WithAttributes(attrs...))
+	ops.Add(ctx, 1, metric.WithAttributes(attrs...))
 }
 
 // RecordOperationDuration records the execution duration of a capability
@@ -137,14 +186,11 @@ func RecordOperationDuration(ctx context.Context, operation string, duration tim
 		status = "error"
 	}
 
-	h, herr := meter().Int64Histogram("caps.operation_duration_ms",
-		metric.WithDescription("Duration of capability operations"),
-		metric.WithUnit("ms"),
-	)
-	if herr != nil {
+	_, _, dur, ok := cachedInstruments()
+	if !ok {
 		return
 	}
-	h.Record(ctx, duration.Milliseconds(),
+	dur.Record(ctx, duration.Milliseconds(),
 		metric.WithAttributes(
 			attribute.String("operation", operation),
 			attribute.String("status", status),

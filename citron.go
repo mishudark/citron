@@ -10,6 +10,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/mishudark/citron/analysis"
@@ -25,6 +26,11 @@ import (
 
 //go:embed HARNESS_GUIDE.md
 var HarnessGuide string
+
+// threadContextKey carries the execution context (including the timeout
+// deadline) through the Starlark thread so capability calls made from
+// generated MCP builtins honor cancellation.
+const threadContextKey = "citron.ctx"
 
 type Options struct {
 	// WorkingDir is the virtual root path for filesystem operations.
@@ -81,9 +87,31 @@ func Analyze(code string) error {
 		return err
 	}
 	if len(issues) > 0 {
-		return issues[0]
+		return errors.Join(toErrorList(issues)...)
 	}
 	return nil
+}
+
+// validateExtras rejects injected globals (e.g. remote MCP tool bindings)
+// whose names collide with Starlark builtins the analyzer treats as pure.
+// Such a global shadows the builtin, so a callback like
+// `secret.map(str)` would call the remote tool with the unwrapped
+// classified value, silently defeating purity verification.
+func validateExtras(extras starlark.StringDict) error {
+	for name := range extras {
+		if analysis.IsPureBuiltin(name) {
+			return fmt.Errorf("citron: extras global %q shadows the pure builtin %q; rename the remote tool", name, name)
+		}
+	}
+	return nil
+}
+
+func toErrorList(issues []analysis.Issue) []error {
+	errs := make([]error, len(issues))
+	for i, iss := range issues {
+		errs[i] = iss
+	}
+	return errs
 }
 
 // seedVirtualFS copies all regular files from a real directory into a VirtualFileSystem.
@@ -119,11 +147,12 @@ func vfsWorkingDir(opts Options) string {
 // the provided options. When DoNotTrack is true, noop providers are used
 // regardless of any TracerProvider or MeterProvider settings.
 // Returns a function that flushes any pending metric data (no-op if no SDK
-// provider was created).
-func applyTelemetry(opts Options) func() {
+// provider was created), and an error when metric export setup fails so the
+// caller can surface it instead of silently dropping metrics.
+func applyTelemetry(opts Options) (func(), error) {
 	if opts.DoNotTrack {
 		caps.SetNoopTelemetry()
-		return func() {}
+		return func() {}, nil
 	}
 
 	if opts.TracerProvider != nil {
@@ -138,13 +167,12 @@ func applyTelemetry(opts Options) func() {
 	if opts.MetricsOutputPath != "" {
 		f, err := os.Create(opts.MetricsOutputPath)
 		if err != nil {
-			// If the file can't be created, fall back to the configured provider.
-			return func() {}
+			return func() {}, fmt.Errorf("citron: opening metrics output %q: %w", opts.MetricsOutputPath, err)
 		}
 		exporter, err := stdoutmetric.New(stdoutmetric.WithWriter(f))
 		if err != nil {
 			_ = f.Close()
-			return func() {}
+			return func() {}, fmt.Errorf("citron: creating metrics exporter: %w", err)
 		}
 		reader := sdkmetric.NewPeriodicReader(exporter)
 		provider := sdkmetric.NewMeterProvider(
@@ -155,14 +183,17 @@ func applyTelemetry(opts Options) func() {
 			_ = provider.ForceFlush(context.Background())
 			_ = provider.Shutdown(context.Background())
 			_ = f.Close()
-		}
+		}, nil
 	}
 
-	return func() {}
+	return func() {}, nil
 }
 
 func SafeExecute(code string, opts Options) (*Result, error) {
-	flushMetrics := applyTelemetry(opts)
+	flushMetrics, err := applyTelemetry(opts)
+	if err != nil {
+		return nil, err
+	}
 	defer flushMetrics()
 
 	_, span := caps.StartSpan(context.Background(), "citron.SafeExecute",
@@ -176,11 +207,17 @@ func SafeExecute(code string, opts Options) (*Result, error) {
 		return nil, err
 	}
 
+	if err := validateExtras(opts.Extras); err != nil {
+		caps.EndSpan(span, err)
+		caps.RecordOperationWithKind(context.Background(), "safe_execute", "setup", err)
+		return nil, err
+	}
+
 	start := time.Now()
 
 	var secureOut *os.File
 	if opts.SecureOutputPath != "" {
-		f, err := os.OpenFile(opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		f, err := os.OpenFile(opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			caps.EndSpan(span, err)
 			caps.RecordOperationWithKind(context.Background(), "safe_execute", "setup", err)
@@ -221,6 +258,9 @@ func SafeExecute(code string, opts Options) (*Result, error) {
 		defer cancel()
 	}
 
+	thread := &starlark.Thread{Name: "agent"}
+	thread.Print = func(_ *starlark.Thread, msg string) { ioCap.Println(msg) }
+
 	done := make(chan error, 1)
 	go func() {
 		_, execErr = caps.RequestVirtualFileSystem(wd, vfs, fsCfg, func(fs caps.FileSystem) (any, error) {
@@ -229,9 +269,7 @@ func SafeExecute(code string, opts Options) (*Result, error) {
 				dict["net"] = &starlarkNetwork{n: net}
 				_, errProc := caps.RequestExecPermission(opts.CommandAllowlist, func(proc caps.ProcessPermission) (any, error) {
 					dict["proc"] = &starlarkProc{p: proc}
-
-					thread := &starlark.Thread{Name: "agent"}
-					thread.Print = func(_ *starlark.Thread, msg string) { ioCap.Println(msg) }
+					thread.SetLocal(threadContextKey, ctx)
 					_, errStar := starlark.ExecFileOptions(&syntax.FileOptions{}, thread, "agent.star", code, dict)
 					return nil, errStar
 				})
@@ -245,6 +283,8 @@ func SafeExecute(code string, opts Options) (*Result, error) {
 	select {
 	case execErr = <-done:
 	case <-ctx.Done():
+		thread.Cancel(fmt.Sprintf("execution timed out after %dms", opts.TimeoutMs))
+		<-done
 		duration := time.Since(start)
 		caps.EndSpan(span, fmt.Errorf("execution timed out after %dms", opts.TimeoutMs))
 		caps.RecordOperationWithKind(context.Background(), "safe_execute", "timeout", fmt.Errorf("execution timed out after %dms", opts.TimeoutMs))
@@ -274,6 +314,7 @@ type Session struct {
 	opts    Options
 	vfs     *caps.VirtualFileSystem
 	globals starlark.StringDict
+	mu      sync.Mutex
 }
 
 func NewSession(opts Options) *Session {
@@ -302,7 +343,10 @@ func NewSession(opts Options) *Session {
 }
 
 func (s *Session) Execute(code string) (*Result, error) {
-	flushMetrics := applyTelemetry(s.opts)
+	flushMetrics, err := applyTelemetry(s.opts)
+	if err != nil {
+		return nil, err
+	}
 	defer flushMetrics()
 
 	_, span := caps.StartSpan(context.Background(), "citron.Session.Execute",
@@ -316,11 +360,17 @@ func (s *Session) Execute(code string) (*Result, error) {
 		return nil, err
 	}
 
+	if err := validateExtras(s.opts.Extras); err != nil {
+		caps.EndSpan(span, err)
+		caps.RecordOperationWithKind(context.Background(), "session_execute", "setup", err)
+		return nil, err
+	}
+
 	start := time.Now()
 
 	var secureOut *os.File
 	if s.opts.SecureOutputPath != "" {
-		f, err := os.OpenFile(s.opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		f, err := os.OpenFile(s.opts.SecureOutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			caps.EndSpan(span, err)
 			caps.RecordOperationWithKind(context.Background(), "session_execute", "setup", err)
@@ -332,9 +382,16 @@ func (s *Session) Execute(code string) (*Result, error) {
 
 	var agentOut bytes.Buffer
 	ioCap := caps.NewIOCapability(secureOut, &agentOut)
-	s.globals["io"] = &starlarkIO{io: ioCap}
-	maps.Copy(s.globals, s.opts.Extras)
-	s.globals["io"] = &starlarkIO{io: ioCap} // builtins take precedence
+
+	// Each execution gets its own copy of the session globals so concurrent
+	// Execute calls never share the underlying map. Capability bindings are
+	// injected per run and never merged back, so stale handles cannot persist.
+	s.mu.Lock()
+	globals := make(starlark.StringDict, len(s.globals)+4)
+	maps.Copy(globals, s.globals)
+	s.mu.Unlock()
+	maps.Copy(globals, s.opts.Extras)
+	globals["io"] = &starlarkIO{io: ioCap} // builtins take precedence
 
 	var execErr error
 
@@ -348,20 +405,28 @@ func (s *Session) Execute(code string) (*Result, error) {
 	fsCfg := &caps.FileSystemConfig{ClassifiedPatterns: s.opts.ClassifiedPatterns}
 	wd := vfsWorkingDir(s.opts)
 
+	thread := &starlark.Thread{Name: "agent"}
+	thread.Print = func(_ *starlark.Thread, msg string) { ioCap.Println(msg) }
+
 	done := make(chan error, 1)
 	go func() {
 		_, execErr = caps.RequestVirtualFileSystem(wd, s.vfs, fsCfg, func(fs caps.FileSystem) (any, error) {
-			s.globals["fs"] = &starlarkFileSystem{fs: fs}
+			globals["fs"] = &starlarkFileSystem{fs: fs}
 			_, errNet := caps.RequestNetwork(s.opts.NetworkAllowlist, func(net caps.Network) (any, error) {
-				s.globals["net"] = &starlarkNetwork{n: net}
+				globals["net"] = &starlarkNetwork{n: net}
 				_, errProc := caps.RequestExecPermission(s.opts.CommandAllowlist, func(proc caps.ProcessPermission) (any, error) {
-					s.globals["proc"] = &starlarkProc{p: proc}
+					globals["proc"] = &starlarkProc{p: proc}
 
-					thread := &starlark.Thread{Name: "agent"}
-					thread.Print = func(_ *starlark.Thread, msg string) { ioCap.Println(msg) }
-					resultDict, errStar := starlark.ExecFileOptions(&syntax.FileOptions{}, thread, "agent.star", code, s.globals)
+					thread.SetLocal(threadContextKey, ctx)
+					resultDict, errStar := starlark.ExecFileOptions(&syntax.FileOptions{}, thread, "agent.star", code, globals)
 					if errStar == nil {
-						maps.Copy(s.globals, resultDict)
+						for name, value := range resultDict {
+							switch name {
+							case "io", "fs", "net", "proc":
+								continue
+							}
+							globals[name] = value
+						}
 					}
 					return nil, errStar
 				})
@@ -375,6 +440,8 @@ func (s *Session) Execute(code string) (*Result, error) {
 	select {
 	case execErr = <-done:
 	case <-ctx.Done():
+		thread.Cancel(fmt.Sprintf("execution timed out after %dms", s.opts.TimeoutMs))
+		<-done
 		duration := time.Since(start)
 		caps.EndSpan(span, fmt.Errorf("execution timed out after %dms", s.opts.TimeoutMs))
 		caps.RecordOperationWithKind(context.Background(), "session_execute", "timeout", fmt.Errorf("execution timed out after %dms", s.opts.TimeoutMs))
@@ -383,6 +450,18 @@ func (s *Session) Execute(code string) (*Result, error) {
 	}
 
 	duration := time.Since(start)
+
+	// Merge script-defined globals back into the session state (excluding
+	// per-run capability bindings) after the exec goroutine has exited.
+	s.mu.Lock()
+	for name, value := range globals {
+		switch name {
+		case "io", "fs", "net", "proc":
+			continue
+		}
+		s.globals[name] = value
+	}
+	s.mu.Unlock()
 
 	if execErr != nil {
 		caps.EndSpan(span, execErr)

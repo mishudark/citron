@@ -34,7 +34,7 @@ func (Classified[T]) MarshalJSON() ([]byte, error) {
 }
 
 func (Classified[T]) UnmarshalJSON([]byte) error {
-	return nil
+	return fmt.Errorf("cap: cannot unmarshal into Classified; use Classify to construct classified values explicitly")
 }
 
 func Classify[T any](v T) Classified[T] {

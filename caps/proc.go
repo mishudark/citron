@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -18,7 +19,7 @@ type ProcessPermission interface {
 type procImpl struct {
 	capabilityMarker
 	commands map[string]bool
-	valid    bool
+	valid    atomic.Bool
 }
 
 func RequestExecPermission[T any](
@@ -35,18 +36,16 @@ func RequestExecPermission[T any](
 	for _, c := range commands {
 		cmdSet[c] = true
 	}
-	p := &procImpl{
-		commands: cmdSet,
-		valid:    true,
-	}
-	defer func() { p.valid = false }()
+	p := &procImpl{commands: cmdSet}
+	p.valid.Store(true)
+	defer func() { p.valid.Store(false) }()
 	result, err := op(p)
 	EndSpan(span, err)
 	return result, err
 }
 
 func (p *procImpl) validate(command string) error {
-	if !p.valid {
+	if !p.valid.Load() {
 		return fmt.Errorf("cap: ProcessPermission used outside its scope")
 	}
 	if len(p.commands) == 0 {
@@ -79,13 +78,14 @@ func Exec(perm ProcessPermission, command string, args []string, opts ExecOption
 		RecordOperation(context.Background(), "exec", err)
 		return ProcessResult{}, err
 	}
-	ctx := p
+	ctx := context.Background()
 	if opts.TimeoutMs > 0 {
-		var cancel func()
-		// We use a simple approach: just pass timeout via cmd
-		_ = cancel
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(opts.TimeoutMs)*time.Millisecond)
+		defer cancel()
 	}
-	cmd := exec.Command(command, args...)
+	cmd := exec.CommandContext(ctx, command, args...) //nolint:gosec
+	configureKillGroup(cmd)
 	if opts.WorkingDir != "" {
 		cmd.Dir = opts.WorkingDir
 	}
@@ -94,24 +94,14 @@ func Exec(perm ProcessPermission, command string, args []string, opts ExecOption
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Run()
-	}()
+	runErr := cmd.Run()
 
-	var runErr error
-	if opts.TimeoutMs > 0 {
-		timer := time.After(time.Duration(opts.TimeoutMs) * time.Millisecond)
-		select {
-		case runErr = <-done:
-		case <-timer:
-			_ = cmd.Process.Kill()
-			runErr = fmt.Errorf("cap: command timed out after %dms", opts.TimeoutMs)
-		}
-	} else {
-		runErr = <-done
+	if opts.TimeoutMs > 0 && ctx.Err() == context.DeadlineExceeded {
+		timeoutErr := fmt.Errorf("cap: command timed out after %dms", opts.TimeoutMs)
+		EndSpan(span, timeoutErr)
+		RecordOperation(context.Background(), "exec", timeoutErr)
+		return ProcessResult{}, timeoutErr
 	}
-	_ = ctx
 
 	exitCode := 0
 	if runErr != nil {

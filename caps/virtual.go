@@ -2,28 +2,91 @@ package caps
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"go.opentelemetry.io/otel/attribute"
 )
 
+// Capacity limits for script-driven VFS writes. Seeding via Set is trusted
+// host code and not limited; scripts are.
+const (
+	maxVFSFiles = 100_000
+	maxVFSBytes = 64 << 20 // 64 MiB of total content
+)
+
+// ErrVFSQuotaExceeded is returned when a script-driven write would exceed
+// the VFS file or byte budget.
+var ErrVFSQuotaExceeded = errors.New("cap: virtual filesystem quota exceeded")
+
+// VirtualFileSystem is an in-memory store of files. It tracks directories
+// explicitly so that directory semantics (mkdir, children, walk, is_dir)
+// behave like a real filesystem. It is safe for concurrent use.
 type VirtualFileSystem struct {
-	files sync.Map
+	files      sync.Map // path -> string
+	dirs       sync.Map // path -> struct{}
+	appendMu   sync.Mutex
+	totalBytes atomic.Int64
+	fileCount  atomic.Int64
 }
 
 func NewVirtualFileSystem() *VirtualFileSystem {
 	return &VirtualFileSystem{}
 }
 
+// Set stores a file, creating parent directories implicitly. It is the
+// trusted seeding entry point and is not subject to quota limits.
 func (vfs *VirtualFileSystem) Set(path, content string) {
+	vfs.set(path, content)
+}
+
+// set stores a file and maintains directory and accounting metadata.
+func (vfs *VirtualFileSystem) set(path, content string) {
+	path = filepath.Clean(path)
+	vfs.ensureDirs(filepath.Dir(path))
+	var oldLen int
+	if old, ok := vfs.files.Load(path); ok {
+		oldLen = len(old.(string))
+	} else {
+		vfs.fileCount.Add(1)
+	}
 	vfs.files.Store(path, content)
+	vfs.totalBytes.Add(int64(len(content) - oldLen))
+}
+
+// store is the quota-checked write path used by script-facing operations.
+func (vfs *VirtualFileSystem) store(path, content string) error {
+	path = filepath.Clean(path)
+	if _, exists := vfs.files.Load(path); !exists && vfs.fileCount.Load() >= maxVFSFiles {
+		return fmt.Errorf("%w: more than %d files", ErrVFSQuotaExceeded, maxVFSFiles)
+	}
+	var oldLen int
+	if old, ok := vfs.files.Load(path); ok {
+		oldLen = len(old.(string))
+	}
+	projected := vfs.totalBytes.Load() - int64(oldLen) + int64(len(content))
+	if projected > maxVFSBytes {
+		return fmt.Errorf("%w: total content would exceed %d bytes", ErrVFSQuotaExceeded, int64(maxVFSBytes))
+	}
+	vfs.set(path, content)
+	return nil
+}
+
+// ensureDirs records dir and all its ancestors as directories.
+func (vfs *VirtualFileSystem) ensureDirs(dir string) {
+	for d := dir; d != "/" && d != "." && d != ""; d = filepath.Dir(d) {
+		if _, existed := vfs.dirs.LoadOrStore(d, struct{}{}); existed {
+			return
+		}
+	}
 }
 
 func (vfs *VirtualFileSystem) Get(path string) (string, bool) {
-	v, ok := vfs.files.Load(path)
+	v, ok := vfs.files.Load(filepath.Clean(path))
 	if !ok {
 		return "", false
 	}
@@ -31,17 +94,70 @@ func (vfs *VirtualFileSystem) Get(path string) (string, bool) {
 }
 
 func (vfs *VirtualFileSystem) Delete(path string) {
-	vfs.files.Delete(path)
+	path = filepath.Clean(path)
+	if _, ok := vfs.files.LoadAndDelete(path); ok {
+		vfs.fileCount.Add(-1)
+	}
 }
 
+// List returns the immediate children (files and directories) of dir,
+// with exact parent matching so "/data" no longer matches "/database".
 func (vfs *VirtualFileSystem) List(dir string) []DirEntry {
+	dir = filepath.Clean(dir)
 	var result []DirEntry
 	vfs.files.Range(func(key, value any) bool {
 		p := key.(string)
-		if strings.HasPrefix(p, dir) {
+		if filepath.Dir(p) == dir {
 			result = append(result, DirEntry{
-				Path: p,
-				Name: filepath.Base(p),
+				Path:        p,
+				Name:        filepath.Base(p),
+				IsDirectory: false,
+				Size:        int64(len(value.(string))),
+			})
+		}
+		return true
+	})
+	vfs.dirs.Range(func(key, _ any) bool {
+		p := key.(string)
+		if p != dir && filepath.Dir(p) == dir {
+			result = append(result, DirEntry{
+				Path:        p,
+				Name:        filepath.Base(p),
+				IsDirectory: true,
+			})
+		}
+		return true
+	})
+	return result
+}
+
+// Walk returns dir and every file/directory beneath it, recursively.
+func (vfs *VirtualFileSystem) Walk(dir string) []DirEntry {
+	dir = filepath.Clean(dir)
+	prefix := dir
+	if prefix != "/" {
+		prefix = dir + "/"
+	}
+	var result []DirEntry
+	vfs.dirs.Range(func(key, _ any) bool {
+		p := key.(string)
+		if p == dir || strings.HasPrefix(p, prefix) {
+			result = append(result, DirEntry{
+				Path:        p,
+				Name:        filepath.Base(p),
+				IsDirectory: true,
+			})
+		}
+		return true
+	})
+	vfs.files.Range(func(key, value any) bool {
+		p := key.(string)
+		if strings.HasPrefix(p, prefix) {
+			result = append(result, DirEntry{
+				Path:        p,
+				Name:        filepath.Base(p),
+				IsDirectory: false,
+				Size:        int64(len(value.(string))),
 			})
 		}
 		return true
@@ -54,7 +170,7 @@ type virtualFSImpl struct {
 	root  string
 	vfs   *VirtualFileSystem
 	cfg   *FileSystemConfig
-	valid bool
+	valid atomic.Bool
 }
 
 type virtualEntryImpl struct {
@@ -63,7 +179,7 @@ type virtualEntryImpl struct {
 }
 
 func (e *virtualEntryImpl) checkValid() error {
-	if e.fs == nil || !e.fs.valid {
+	if e.fs == nil || !e.fs.valid.Load() {
 		return errCapabilityUsedAfterScope("FileEntry (virtual)")
 	}
 	return nil
@@ -95,23 +211,35 @@ func RequestVirtualFileSystem[T any](
 		cfg.ClassifiedPatterns = DefaultClassifiedPatterns
 	}
 	fs := &virtualFSImpl{
-		root:  root,
-		vfs:   vfs,
-		cfg:   cfg,
-		valid: true,
+		root: root,
+		vfs:  vfs,
+		cfg:  cfg,
 	}
-	defer func() { fs.valid = false }()
+	fs.valid.Store(true)
+	defer func() { fs.valid.Store(false) }()
 	result, err := op(fs)
 	EndSpan(span, err)
 	return result, err
 }
 
 func (fs *virtualFSImpl) Access(path string) (FileEntry, error) {
-	if !fs.valid {
+	if !fs.valid.Load() {
 		return nil, fmt.Errorf("cap: FileSystem used outside its scope")
 	}
-	full := filepath.Join(fs.root, path)
+	full, err := fs.resolve(path)
+	if err != nil {
+		return nil, err
+	}
 	return &virtualEntryImpl{fs: fs, path: full}, nil
+}
+
+func (fs *virtualFSImpl) resolve(req string) (string, error) {
+	full := filepath.Clean(filepath.Join(fs.root, req))
+	rel, err := filepath.Rel(fs.root, full)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("cap: path %q escapes root %q", req, fs.root)
+	}
+	return full, nil
 }
 
 func (e *virtualEntryImpl) Path() string { return e.path }
@@ -149,8 +277,7 @@ func (e *virtualEntryImpl) Write(content string) error {
 	if e.IsClassified() {
 		return fmt.Errorf("cap: Write() not allowed on classified path %q; use WriteClassified", e.path)
 	}
-	e.fs.vfs.Set(path, content)
-	return nil
+	return e.fs.vfs.store(path, content)
 }
 
 func (e *virtualEntryImpl) Append(content string) error {
@@ -161,9 +288,11 @@ func (e *virtualEntryImpl) Append(content string) error {
 	if e.IsClassified() {
 		return fmt.Errorf("cap: Append() not allowed on classified path %q", e.path)
 	}
+	// Serialize the read-modify-write so concurrent appends cannot lose data.
+	e.fs.vfs.appendMu.Lock()
+	defer e.fs.vfs.appendMu.Unlock()
 	existing, _ := e.fs.vfs.Get(path)
-	e.fs.vfs.Set(path, existing+content)
-	return nil
+	return e.fs.vfs.store(path, existing+content)
 }
 
 func (e *virtualEntryImpl) ReadLines() ([]string, error) {
@@ -202,8 +331,12 @@ func (e *virtualEntryImpl) Delete() error {
 }
 
 func (e *virtualEntryImpl) MkdirAll() error {
-	_, err := e.pathOrError()
-	return err
+	path, err := e.pathOrError()
+	if err != nil {
+		return err
+	}
+	e.fs.vfs.ensureDirs(path)
+	return nil
 }
 
 func (e *virtualEntryImpl) Children() ([]DirEntry, error) {
@@ -219,7 +352,7 @@ func (e *virtualEntryImpl) Walk() ([]DirEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	return e.fs.vfs.List(path), nil
+	return e.fs.vfs.Walk(path), nil
 }
 
 func (e *virtualEntryImpl) Exists() bool {
@@ -227,16 +360,35 @@ func (e *virtualEntryImpl) Exists() bool {
 	if err != nil {
 		return false
 	}
-	_, ok := e.fs.vfs.Get(path)
-	return ok
+	if _, ok := e.fs.vfs.Get(path); ok {
+		return true
+	}
+	_, isDir := e.fs.vfs.dirs.Load(path)
+	return isDir
 }
 
 func (e *virtualEntryImpl) IsDir() bool {
-	_, err := e.pathOrError()
+	path, err := e.pathOrError()
 	if err != nil {
 		return false
 	}
-	return false
+	if _, ok := e.fs.vfs.dirs.Load(path); ok {
+		return true
+	}
+	// A directory also exists implicitly when files live beneath it.
+	prefix := path
+	if prefix != "/" {
+		prefix = path + "/"
+	}
+	found := false
+	e.fs.vfs.files.Range(func(key, _ any) bool {
+		if strings.HasPrefix(key.(string), prefix) {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func (e *virtualEntryImpl) Size() (int64, error) {
@@ -292,6 +444,5 @@ func (e *virtualEntryImpl) WriteClassified(data Classified[string]) error {
 	if !e.IsClassified() {
 		return fmt.Errorf("cap: WriteClassified() only allowed on classified paths")
 	}
-	e.fs.vfs.Set(path, data.value)
-	return nil
+	return e.fs.vfs.store(path, data.value)
 }
